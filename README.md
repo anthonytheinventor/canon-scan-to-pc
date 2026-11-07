@@ -17,6 +17,9 @@ is saved to `~/Scans` as a PDF, with a desktop notification.
 - Removes itself from the printer's list when the computer sleeps or shuts down, and
   comes back on wake-up
 - No root, no Canon software, no build step: one Python file plus a systemd user service
+- Light: one process, about 16 MB of memory, and practically no CPU while idle (one tiny
+  network packet every 10 seconds). Scans are converted in a short-lived helper process, a
+  page at a time, so even long feeder scans don't make the service grow
 
 This is a reimplementation of Canon's network protocol (MFNP), worked out from packet
 captures of the Windows utility. It is not made or endorsed by Canon.
@@ -37,10 +40,11 @@ Requirements:
 - Linux with systemd, Python 3, and these packages (names for Debian, Ubuntu and Linux Mint):
 
   ```
-  sudo apt install sane-utils python3-pil avahi-utils libglib2.0-bin
+  sudo apt install sane-utils python3-pil avahi-utils
   ```
 
-  Fedora: `sane-backends python3-pillow avahi-tools glib2`. Arch: `sane python-pillow avahi glib2`.
+  Fedora: `sane-backends python3-pillow avahi-tools`. Arch: `sane python-pillow avahi`.
+  `avahi-utils` is only needed to find the printer automatically.
 
 ## Install
 
@@ -122,6 +126,10 @@ the computer's name (64 bytes, ASCII):
 
 After the acknowledgement the scan is fetched over TCP port 8610, which SANE's pixma backend
 already knows how to do, so this program runs `scanimage` for that part.
+
+Before the computer sleeps, the service signs off. It holds a logind *delay* sleep inhibitor
+and listens for logind's `PrepareForSleep` signal over the system D-Bus, then registers again
+after wake-up.
 
 SANE's pixma backend has its own version of this poll (for button support), but it sends the
 name as UTF-16 and never registers, so the printer doesn't list the computer. That's the

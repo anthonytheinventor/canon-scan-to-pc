@@ -20,12 +20,10 @@ missing=""
 command -v scanimage >/dev/null || missing="$missing sane-utils"
 python3 -c 'import PIL' 2>/dev/null || missing="$missing python3-pil"
 command -v avahi-browse >/dev/null || missing="$missing avahi-utils"
-command -v gdbus >/dev/null || missing="$missing libglib2.0-bin"
 if [ -n "$missing" ]; then
     echo "Missing packages:$missing"
     echo "On Debian, Ubuntu or Mint:  sudo apt install$missing"
-    echo "(avahi-utils is only needed to find the printer automatically,"
-    echo " libglib2.0-bin only to sign off before the computer sleeps)"
+    echo "(avahi-utils is only needed to find the printer automatically)"
     exit 1
 fi
 

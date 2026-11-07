@@ -8,7 +8,6 @@ saves it (PDF by default) to the output folder.
 
 Protocol notes come from packet captures of the Windows utility; see README.md.
 """
-import argparse
 import configparser
 import getpass
 import logging
@@ -20,22 +19,14 @@ import socket
 import struct
 import subprocess
 import sys
-import tempfile
 import threading
 import time
-import urllib.request
 
 PORT = 8610
 KEEPALIVE_S = 10
 CONFIG_PATH = os.path.expanduser("~/.config/canon-scan-to-pc/config.ini")
 STATE_DIR = os.path.expanduser("~/.local/state/canon-scan-to-pc")
 SANE_DIR = os.path.join(STATE_DIR, "sane")
-
-def default_name():
-    """This computer's host name, in the form the printer's list can show (ASCII, 15 chars)."""
-    name = re.sub(r"[^A-Z0-9-]", "", socket.gethostname().split(".")[0].upper())
-    return name[:15] or "LINUX-PC"
-
 
 DEFAULTS = {
     "printer": {"host": "", "name": ""},  # empty host = find the printer on the network
@@ -54,14 +45,26 @@ DEFAULTS = {
 }
 
 PAPER_MM = {"letter": (215.9, 279.4), "legal": (215.9, 355.6), "a4": (210.0, 297.0)}
+SANE_SOURCES = {"flatbed": "Flatbed", "adf": "Automatic Document Feeder", "adf-duplex": "ADF Duplex"}
 
 log = logging.getLogger("canon-scan-to-pc")
 
 
-# ---------------------------------------------------------------- protocol
+def default_name():
+    """This computer's host name, in the form the printer's list can show (ASCII, 15 chars)."""
+    name = re.sub(r"[^A-Z0-9-]", "", socket.gethostname().split(".")[0].upper())
+    return name[:15] or "LINUX-PC"
+
+
+# ---------------------------------------------------------------- MFNP protocol
+
+def mfnp_header(cmd, seq, payload_len):
+    return struct.pack(">4sBBhHHI", b"MFNP", 0x02, cmd, 0, seq, 0, payload_len)
+
 
 class Printer:
-    """The MFNP poll dialog with one printer."""
+    """The MFNP poll dialog with one printer. Thread-safe: the sleep watcher signs off
+    from its own thread."""
 
     def __init__(self, host, name, user):
         self.host = host
@@ -69,57 +72,68 @@ class Printer:
         self.user_host = f"{user}  {name}".encode("ascii", "replace")[:194]
         self.seq = 0
         self.dialog = 0
+        self.addr = None                  # host resolved to an IP address
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.settimeout(3)
-        self.lock = threading.Lock()     # the sleep watcher signs off from another thread
+        self.lock = threading.Lock()
 
-    def _xchg(self, cmd, payload):
+    def _resolve(self):
+        try:
+            self.addr = socket.gethostbyname(self.host)
+        except OSError as e:
+            log.debug("cannot resolve %s: %s", self.host, e)
+            self.addr = None
+        return self.addr
+
+    def _xchg(self, cmd, payload, tries=2):
+        """Send one command and return the matching reply's payload, or None."""
         with self.lock:
-            return self._xchg_locked(cmd, payload)
-
-    def _xchg_locked(self, cmd, payload):
-        self.seq = (self.seq + 1) & 0xFFFF
-        packet = struct.pack(">4sBBhHHI", b"MFNP", 0x02, cmd, 0, self.seq, 0, len(payload)) + payload
-        for _ in range(2):
-            try:
-                self.sock.sendto(packet, (self.host, PORT))
-                while True:
-                    data, addr = self.sock.recvfrom(4096)
-                    if addr[0] != self.host or len(data) < 16 or data[:4] != b"MFNP":
-                        continue
-                    if struct.unpack(">H", data[8:10])[0] != self.seq:
-                        continue          # a late reply to an earlier packet
-                    return data[16:]
-            except socket.timeout:
-                continue
-            except OSError as e:         # network down (suspend, Wi-Fi switch)
-                log.debug("send failed: %s", e)
+            if self.addr is None and self._resolve() is None:
                 return None
-        return None
+            self.seq = (self.seq + 1) & 0xFFFF
+            packet = mfnp_header(cmd, self.seq, len(payload)) + payload
+            for _ in range(tries):
+                try:
+                    self.sock.sendto(packet, (self.addr, PORT))
+                    deadline = time.monotonic() + 3
+                    while (left := deadline - time.monotonic()) > 0:
+                        self.sock.settimeout(left)
+                        data, addr = self.sock.recvfrom(4096)
+                        if (addr[0] == self.addr and len(data) >= 16 and data[:4] == b"MFNP"
+                                and struct.unpack(">H", data[8:10])[0] == self.seq):
+                            return data[16:]
+                        # anything else is a late reply to an earlier packet: skip it
+                except socket.timeout:
+                    continue
+                except OSError as e:      # network down (suspend, Wi-Fi switch)
+                    log.debug("send to %s failed: %s", self.addr, e)
+                    return None
+            return None
 
-    def _poll(self, ptype, dialog, tail):
+    def _poll(self, ptype, dialog, tail, tries=2):
         head = struct.pack(">HHI", ptype, 0, dialog) + self.name.ljust(64, b"\0")
-        return self._xchg(0x32, head + tail)
+        return self._xchg(0x32, head + tail, tries)
 
     def register(self):
         """discover, poll type 0, poll type 1; the type 1 reply carries our dialog id."""
-        if self._xchg(0x01, b"") is None:
+        self._resolve()                   # the printer's address may have changed
+        if self._xchg(0x01, b"") is None or self._poll(0, 0, b"\0" * 8) is None:
             return False
-        if self._poll(0, 0, b"\0" * 8) is None:
-            return False
-        r = self._poll(1, 0, struct.pack(">II", 0, 195) + self.user_host.ljust(195, b"\0"))
+        # Sent once only: a resend whose first copy did arrive would create a second entry.
+        r = self._poll(1, 0, struct.pack(">II", 0, 195) + self.user_host.ljust(195, b"\0"),
+                       tries=1)
         if r is None or len(r) < 8:
             return False
         self.dialog = struct.unpack(">I", r[4:8])[0]
         return self.dialog != 0
 
     def keepalive(self):
-        """Poll type 2. Returns None (no answer), 'ok', 'scan' or 'lost'."""
+        """Poll type 2. Returns (status, reply): status None (no answer), 'ok', 'scan' or 'lost'."""
+        dialog = self.dialog
         stamp = time.strftime("%Y%m%d%H%M%S").encode().ljust(16, b"\0")
-        r = self._poll(2, self.dialog, struct.pack(">II", 0, 0x10) + stamp)
+        r = self._poll(2, dialog, struct.pack(">II", 0, 0x10) + stamp)
         if r is None or len(r) < 8:
             return None, b""
-        if struct.unpack(">I", r[4:8])[0] != self.dialog:
+        if struct.unpack(">I", r[4:8])[0] != dialog:
             return "lost", r
         if r[2] & 0x80:
             return "scan", r
@@ -131,24 +145,22 @@ class Printer:
         return self._poll(5, self.dialog, b"\0" * 8)
 
     def sign_off(self, dialog=None):
-        dialog = self.dialog if dialog is None else dialog
+        """Remove a registration (ours by default) from the printer's list."""
+        if dialog is None:
+            dialog, self.dialog = self.dialog, 0
         if dialog:
             self._poll(4, dialog, b"\0" * 8)
-        if dialog == self.dialog:
-            self.dialog = 0
 
 
 def mfnp_identity(host, timeout=2):
     """Ask a host for its MFNP identity (IEEE 1284 string); None if it doesn't speak MFNP."""
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.settimeout(timeout)
-    try:
-        s.sendto(struct.pack(">4sBBhHHI", b"MFNP", 0x02, 0x30, 0, 1, 0, 0), (host, PORT))
-        data, _ = s.recvfrom(4096)
-    except OSError:
-        return None
-    finally:
-        s.close()
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.settimeout(timeout)
+        try:
+            s.sendto(mfnp_header(0x30, 1, 0), (host, PORT))
+            data, _ = s.recvfrom(4096)
+        except OSError:
+            return None
     if data[:4] != b"MFNP":
         return None
     return data[16:].split(b"\0")[0].decode("latin-1", "replace")
@@ -171,10 +183,9 @@ def discover():
     found = {}
     for line in out.splitlines():
         f = line.split(";")
-        if len(f) < 10 or f[0] != "=" or f[2] != "IPv4":
+        if len(f) < 10 or f[0] != "=" or f[2] != "IPv4" or f[7] in found:
             continue
-        txt = f[9]
-        if '"usb_MFG=Canon"' not in txt or '"Scan=T"' not in txt or f[7] in found:
+        if '"usb_MFG=Canon"' not in f[9] or '"Scan=T"' not in f[9]:
             continue
         ident = mfnp_identity(f[7])
         if ident:
@@ -183,150 +194,439 @@ def discover():
     return sorted(found.items())
 
 
+def find_printer():
+    """The one Canon MFNP scanner on the network, or None (logging why)."""
+    printers = discover()
+    if len(printers) == 1:
+        log.info("found %s at %s", printers[0][1], printers[0][0])
+        return printers[0][0]
+    if len(printers) > 1:
+        log.error("found several Canon scanners (%s); set host in %s",
+                  ", ".join(f"{m} at {ip}" for ip, m in printers), CONFIG_PATH)
+    return None
+
+
 # ---------------------------------------------------------------- scanning
 
+_sane_devices = {}
+
+
 def sane_device(host):
-    """A private SANE config that only loads pixma, pointed straight at the printer."""
+    """SANE device name and environment: a private SANE config that loads only pixma,
+    pointed straight at the printer, so no other backend is probed."""
     os.makedirs(SANE_DIR, exist_ok=True)
-    with open(os.path.join(SANE_DIR, "dll.conf"), "w") as f:
-        f.write("pixma\n")
-    with open(os.path.join(SANE_DIR, "pixma.conf"), "w") as f:
-        f.write(f"mfnp://{host}/timeout=5000\n")
+    for name, text in (("dll.conf", "pixma\n"), ("pixma.conf", f"mfnp://{host}/timeout=5000\n")):
+        path = os.path.join(SANE_DIR, name)
+        try:
+            same = open(path).read() == text
+        except OSError:
+            same = False
+        if not same:
+            with open(path, "w") as f:
+                f.write(text)
     env = dict(os.environ, SANE_CONFIG_DIR=SANE_DIR)
-    out = subprocess.run(["scanimage", "-f", "%d%n"], env=env, capture_output=True, text=True, timeout=60)
-    devices = [d for d in out.stdout.split() if d.startswith("pixma:")]
-    return (devices[0] if devices else None), env
+    if host not in _sane_devices:
+        out = subprocess.run(["scanimage", "-f", "%d%n"], env=env, capture_output=True,
+                             text=True, timeout=60).stdout
+        devices = [d for d in out.split() if d.startswith("pixma:")]
+        if not devices:
+            return None, env
+        _sane_devices[host] = devices[0]
+    return _sane_devices[host], env
 
 
 def feeder_loaded(host):
-    """Ask the printer's eSCL status page whether pages are in the document feeder."""
+    """Whether pages are in the document feeder, from the printer's eSCL status page:
+    True, False, or None if the page couldn't be read. A plain socket keeps urllib
+    (and its ~6 MB of imports) out of the service."""
     try:
-        with urllib.request.urlopen(f"http://{host}/eSCL/ScannerStatus", timeout=5) as r:
-            body = r.read().decode("utf-8", "replace")
+        with socket.create_connection((host, 80), timeout=5) as s:
+            s.sendall(f"GET /eSCL/ScannerStatus HTTP/1.0\r\nHost: {host}\r\n\r\n".encode())
+            body = b""
+            while len(body) < 65536 and (chunk := s.recv(4096)):
+                body += chunk
     except OSError:
-        return False
-    m = re.search(r"<scan:AdfState>([^<]*)<", body)
-    return bool(m) and m.group(1) == "ScannerAdfLoaded"
+        return None
+    m = re.search(rb"<scan:AdfState>([^<]*)<", body)
+    return None if not m else m.group(1) == b"ScannerAdfLoaded"
 
 
-def scan(cfg, host, mode=None):
+def run_scanimage(cmd, env, should_stop):
+    """Run scanimage; stop it if the service is stopping. Returns (exit code, stderr)."""
+    p = subprocess.Popen(cmd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    deadline = time.monotonic() + 900
+    while True:
+        try:
+            _, err = p.communicate(timeout=1)
+            return p.returncode, err.decode("utf-8", "replace")
+        except subprocess.TimeoutExpired:
+            if should_stop() or time.monotonic() > deadline:
+                p.terminate()
+                try:
+                    _, err = p.communicate(timeout=10)
+                except subprocess.TimeoutExpired:
+                    p.kill()
+                    _, err = p.communicate()
+                return None, "scan stopped"
+
+
+def unique_path(outdir, stem, ext):
+    path = os.path.join(outdir, f"{stem}.{ext}")
+    n = 2
+    while os.path.exists(path):
+        path = os.path.join(outdir, f"{stem}-{n}.{ext}")
+        n += 1
+    return path
+
+
+def scan(cfg, host, mode=None, should_stop=lambda: False):
+    """Scan with the configured settings. Returns (saved file paths, page count)."""
+    import tempfile
     sc = cfg["scan"]
     mode = mode or sc.get("mode", "Color")
+    resolution = sc.get("resolution", "300")
     device, env = sane_device(host)
     if not device:
         raise RuntimeError("SANE's pixma backend did not find the printer")
+
     source = sc.get("source", "auto").lower()
     if source == "auto":
-        source = "adf" if feeder_loaded(host) else "flatbed"
-    sane_source = {"flatbed": "Flatbed", "adf": "Automatic Document Feeder",
-                   "adf-duplex": "ADF Duplex"}.get(source, "Flatbed")
-    fmt = sc.get("format", "pdf").lower()
+        loaded = feeder_loaded(host)
+        # Status unknown: try the feeder first, and the glass if the feeder is empty.
+        sources = ["flatbed"] if loaded is False else ["adf"] if loaded else ["adf", "flatbed"]
+    else:
+        sources = [source]
+
     outdir = os.path.expanduser(sc.get("output_dir", "~/Scans"))
     os.makedirs(outdir, exist_ok=True)
-    stamp = time.strftime("scan-%Y%m%d-%H%M%S")
+    fmt = sc.get("format", "pdf").lower()
+    stem = time.strftime("scan-%Y%m%d-%H%M%S")
+    paper = sc.get("paper", "letter").lower()
 
     with tempfile.TemporaryDirectory(prefix="canon-scan-") as tmp:
-        cmd = ["scanimage", "-d", device, "--source", sane_source, "--mode", mode,
-               "--resolution", sc.get("resolution", "300"), "--format=png",
-               f"--batch={tmp}/page-%03d.png"]
-        paper = sc.get("paper", "letter").lower()
-        if paper in PAPER_MM:
-            w, h = PAPER_MM[paper]
-            cmd += ["-l", "0", "-t", "0", "-x", str(w), "-y", str(h)]
-        if sane_source == "Flatbed":
-            cmd.append("--batch-count=1")
-        log.info("scanning: %s, %s, %s dpi, %s", sane_source, mode, sc.get("resolution"), paper)
-        p = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=900)
-        pages = sorted(f for f in os.listdir(tmp) if f.endswith(".png") and os.path.getsize(os.path.join(tmp, f)))
+        for src in sources:
+            sane_source = SANE_SOURCES.get(src, "Flatbed")
+            cmd = ["scanimage", "-d", device, "--source", sane_source, "--mode", mode,
+                   "--resolution", resolution, "--format=png", f"--batch={tmp}/page-%03d.png"]
+            if paper in PAPER_MM:
+                w, h = PAPER_MM[paper]
+                cmd += ["-l", "0", "-t", "0", "-x", str(w), "-y", str(h)]
+            if sane_source == "Flatbed":
+                cmd.append("--batch-count=1")
+            log.info("scanning: %s, %s, %s dpi, %s", sane_source, mode, resolution, paper)
+            code, err = run_scanimage(cmd, env, should_stop)
+            pages = sorted(os.path.join(tmp, f) for f in os.listdir(tmp)
+                           if f.endswith(".png") and os.path.getsize(os.path.join(tmp, f)))
+            if pages or should_stop():
+                break
         if not pages:
-            raise RuntimeError(f"scanimage produced no pages (exit {p.returncode}): {p.stderr.strip()[-300:]}")
-        pages = [os.path.join(tmp, f) for f in pages]
-        saved = []
+            _sane_devices.pop(host, None)    # look the device up again next time
+            raise RuntimeError(f"scanimage produced no pages (exit {code}): {err.strip()[-300:]}")
+
         if fmt == "pdf":
-            from PIL import Image
-            images = [Image.open(f).convert("RGB") for f in pages]
-            dest = os.path.join(outdir, stamp + ".pdf")
-            images[0].save(dest, save_all=True, append_images=images[1:],
-                           resolution=float(sc.get("resolution", "300")))
-            saved.append(dest)
-        else:
-            ext = "jpg" if fmt in ("jpeg", "jpg") else "png"
+            dest = unique_path(outdir, stem, "pdf")
+            convert(["pdf", resolution, dest] + pages)
+            saved = [dest]
+        elif fmt == "png":
+            saved = []
             for i, f in enumerate(pages, 1):
-                suffix = f"-{i}" if len(pages) > 1 else ""
-                dest = os.path.join(outdir, f"{stamp}{suffix}.{ext}")
-                if ext == "png":
-                    shutil.move(f, dest)
-                else:
-                    from PIL import Image
-                    Image.open(f).convert("RGB").save(dest, quality=90)
+                dest = unique_path(outdir, stem + (f"-{i}" if len(pages) > 1 else ""), "png")
+                shutil.move(f, dest)
                 saved.append(dest)
+        else:
+            saved = [unique_path(outdir, stem + (f"-{i}" if len(pages) > 1 else ""), "jpg")
+                     for i in range(1, len(pages) + 1)]
+            convert(["jpeg", resolution, *saved, "--"] + pages)
     return saved, len(pages)
 
 
+def convert(args):
+    """Image conversion runs in a short-lived child process, so Pillow and the decoded
+    pages never stay in the service's memory."""
+    p = subprocess.run([sys.executable, "-I", os.path.abspath(__file__), "--convert", *args],
+                       capture_output=True, text=True, timeout=600)
+    if p.returncode != 0:
+        raise RuntimeError(f"converting the scan failed: {p.stderr.strip()[-300:]}")
+
+
+def convert_main(args):
+    """--convert pdf RES DEST PAGE...  |  --convert jpeg RES DEST... -- PAGE...
+    One page in memory at a time; the PDF is built by appending page by page."""
+    from PIL import Image
+    fmt, res = args[0], float(args[1])
+    if fmt == "pdf":
+        dest, pages = args[2], args[3:]
+        write_pdf(dest + ".part", pages, res)
+        os.replace(dest + ".part", dest)
+    else:
+        sep = args.index("--")
+        for dest, page in zip(args[2:sep], args[sep + 1:]):
+            with Image.open(page) as im:
+                if im.mode not in ("L", "RGB"):
+                    im = im.convert("RGB")
+                im.save(dest + ".part", "JPEG", quality=90, dpi=(res, res))
+            os.replace(dest + ".part", dest)
+    return 0
+
+
+def write_pdf(path, pages, res):
+    """A PDF with one full-page image per page, written page by page so only one decoded
+    page is ever in memory. Color and gray pages are stored as JPEG (quality 85), black
+    and white pages as 1-bit images with zlib compression."""
+    import io
+    import zlib
+    from PIL import Image
+    offsets = {}                          # object number -> byte offset
+    kids = []
+    with open(path, "wb") as f:
+        def put(num, body, stream=None):
+            offsets[num] = f.tell()
+            f.write(b"%d 0 obj\n" % num + body)
+            if stream is not None:
+                f.write(b"\nstream\n" + stream + b"\nendstream")
+            f.write(b"\nendobj\n")
+
+        f.write(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+        for k, page in enumerate(pages):
+            img, content, pg = 3 + 3 * k, 4 + 3 * k, 5 + 3 * k
+            with Image.open(page) as im:
+                if im.mode not in ("1", "L", "RGB"):
+                    im = im.convert("RGB")
+                w, h = im.size
+                if im.mode == "1":        # packed rows, 1 = white, as DeviceGray expects
+                    data, cs, bpc, filt = zlib.compress(im.tobytes(), 6), b"DeviceGray", 1, b"FlateDecode"
+                else:
+                    buf = io.BytesIO()
+                    im.save(buf, "JPEG", quality=85)
+                    data = buf.getvalue()
+                    cs = b"DeviceRGB" if im.mode == "RGB" else b"DeviceGray"
+                    bpc, filt = 8, b"DCTDecode"
+            put(img, b"<< /Type /XObject /Subtype /Image /Width %d /Height %d /ColorSpace /%s "
+                     b"/BitsPerComponent %d /Filter /%s /Length %d >>" % (w, h, cs, bpc, filt, len(data)),
+                data)
+            del data
+            pw, ph = w * 72 / res, h * 72 / res
+            draw = b"q %.3f 0 0 %.3f 0 0 cm /Im0 Do Q" % (pw, ph)
+            put(content, b"<< /Length %d >>" % len(draw), draw)
+            put(pg, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 %.3f %.3f] "
+                    b"/Resources << /XObject << /Im0 %d 0 R >> >> /Contents %d 0 R >>" % (pw, ph, img, content))
+            kids.append(b"%d 0 R" % pg)
+        put(2, b"<< /Type /Pages /Kids [%s] /Count %d >>" % (b" ".join(kids), len(kids)))
+        put(1, b"<< /Type /Catalog /Pages 2 0 R >>")
+        xref = f.tell()
+        size = max(offsets) + 1
+        f.write(b"xref\n0 %d\n0000000000 65535 f \n" % size)
+        for num in range(1, size):
+            f.write(b"%010d 00000 n \n" % offsets[num])
+        f.write(b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (size, xref))
+
+
 def notify(cfg, summary, body=""):
-    if cfg["scan"].getboolean("notify", True) and shutil.which("notify-send"):
-        subprocess.run(["notify-send", "-a", "Canon Scan", "-i", "scanner", summary, body], check=False)
+    try:
+        enabled = cfg["scan"].getboolean("notify", True)
+    except ValueError:
+        enabled = True
+    if enabled and shutil.which("notify-send"):
+        try:
+            subprocess.run(["notify-send", "-a", "Canon Scan", "-i", "scanner", summary, body],
+                           timeout=10, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except (OSError, subprocess.SubprocessError) as e:
+            log.debug("notification failed: %s", e)
 
 
 # ---------------------------------------------------------------- sleep handling
+
+class SystemBus:
+    """Just enough of the D-Bus wire protocol to take a logind sleep inhibitor and receive
+    PrepareForSleep, without helper processes or extra Python packages."""
+
+    def __init__(self):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.connect("/run/dbus/system_bus_socket")
+        self.serial = 0
+        self.buf = b""
+        self.fds = []
+        self._auth()
+
+    def _auth(self):
+        uid = str(os.getuid()).encode().hex().encode()
+        self.sock.sendall(b"\0AUTH EXTERNAL " + uid + b"\r\n")
+        if not self._line().startswith(b"OK "):
+            raise OSError("D-Bus authentication failed")
+        self.sock.sendall(b"NEGOTIATE_UNIX_FD\r\n")
+        if not self._line().startswith(b"AGREE_UNIX_FD"):
+            raise OSError("D-Bus bus doesn't pass file descriptors")
+        self.sock.sendall(b"BEGIN\r\n")
+
+    def _line(self):
+        while b"\r\n" not in self.buf:
+            chunk = self.sock.recv(256)
+            if not chunk:
+                raise OSError("D-Bus connection closed")
+            self.buf += chunk
+        line, self.buf = self.buf.split(b"\r\n", 1)
+        return line
+
+    @staticmethod
+    def _pad(b, n):
+        b += b"\0" * (-len(b) % n)
+
+    def _string(self, b, s, code_sig=False):
+        data = s.encode()
+        if code_sig:                      # D-Bus SIGNATURE: 1-byte length
+            b += bytes([len(data)]) + data + b"\0"
+        else:                             # STRING / OBJECT_PATH: 4-byte aligned length
+            self._pad(b, 4)
+            b += struct.pack("<I", len(data)) + data + b"\0"
+
+    def call(self, dest, path, iface, member, sig="", args=()):
+        """Send a method call; returns its serial."""
+        body = bytearray()
+        for a in args:                    # only string arguments are needed here
+            self._string(body, a)
+        fields = bytearray()
+        for code, typ, val in ((1, "o", path), (2, "s", iface), (3, "s", member),
+                               (6, "s", dest)) + (((8, "g", sig),) if sig else ()):
+            self._pad(fields, 8)
+            fields.append(code)
+            self._string(fields, typ, code_sig=True)
+            self._string(fields, val, code_sig=(typ == "g"))
+        self.serial += 1
+        msg = bytearray(struct.pack("<cBBBIII", b"l", 1, 0, 1, len(body), self.serial, len(fields)))
+        msg += fields
+        self._pad(msg, 8)
+        self.sock.sendall(bytes(msg + body))
+        return self.serial
+
+    def receive(self):
+        """Next message as (type, reply_serial, member, body, fds). Blocks."""
+        while True:
+            if len(self.buf) >= 16:
+                if self.buf[:1] != b"l":
+                    raise OSError("unexpected big-endian D-Bus message")
+                body_len, _, fields_len = struct.unpack("<III", self.buf[4:16])
+                start = 16 + fields_len + (-(16 + fields_len) % 8)
+                if len(self.buf) >= start + body_len:
+                    msg, self.buf = self.buf[:start + body_len], self.buf[start + body_len:]
+                    return self._parse(msg, start, fields_len)
+            data, anc, _, _ = self.sock.recvmsg(65536, socket.CMSG_SPACE(16 * 4))
+            if not data:
+                raise OSError("D-Bus connection closed")
+            for level, kind, payload in anc:
+                if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
+                    n = len(payload) // 4
+                    self.fds += struct.unpack(f"<{n}i", payload[:n * 4])
+            self.buf += data
+
+    def _parse(self, msg, start, fields_len):
+        mtype = msg[1]
+        reply_serial, member, n_fds = None, None, 0
+        i, end = 16, 16 + fields_len
+        while i < end:
+            i += -i % 8
+            code = msg[i]
+            sig_len = msg[i + 1]
+            typ = msg[i + 2:i + 2 + sig_len].decode()
+            i += 3 + sig_len
+            if typ in ("s", "o"):
+                i += -i % 4
+                n = struct.unpack("<I", msg[i:i + 4])[0]
+                val = msg[i + 4:i + 4 + n].decode("utf-8", "replace")
+                i += 5 + n
+            elif typ == "g":
+                n = msg[i]
+                val = msg[i + 1:i + 1 + n].decode()
+                i += 2 + n
+            elif typ == "u":
+                i += -i % 4
+                val = struct.unpack("<I", msg[i:i + 4])[0]
+                i += 4
+            else:
+                raise OSError(f"unexpected D-Bus header field type {typ!r}")
+            if code == 3:
+                member = val
+            elif code == 5:
+                reply_serial = val
+            elif code == 9:
+                n_fds = val
+        fds, self.fds = self.fds[:n_fds], self.fds[n_fds:]
+        return mtype, reply_serial, member, msg[start:], fds
+
+    def close(self):
+        try:
+            self.sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        self.sock.close()
+
 
 class SleepWatcher(threading.Thread):
     """Signs off before the computer sleeps, so the printer's list never shows a computer
     that can't answer, and lets the main loop register again after wake-up.
 
-    Listens to logind's PrepareForSleep signal and holds a "delay" sleep inhibitor, which
-    makes logind wait (up to InhibitDelayMaxSec, 5 s by default) until the sign-off is sent.
+    Holds a logind "delay" sleep inhibitor (logind waits up to InhibitDelayMaxSec, 5 s by
+    default, until it's released) and releases it after signing off on PrepareForSleep.
     """
+
+    LOGIN1 = ("org.freedesktop.login1", "/org/freedesktop/login1", "org.freedesktop.login1.Manager")
 
     def __init__(self, printer):
         super().__init__(daemon=True, name="sleep-watcher")
         self.printer = printer
         self.asleep = threading.Event()
-        self.inhibitor = None
-        self.monitor = None
+        self.bus = None
+        self.lock_fd = None
+        self.inhibit_serial = None
 
-    def _take_lock(self):
-        if self.inhibitor is None and shutil.which("systemd-inhibit"):
-            self.inhibitor = subprocess.Popen(
-                ["systemd-inhibit", "--what=sleep", "--mode=delay", "--who=canon-scan-to-pc",
-                 "--why=Removing this computer from the printer's scan list", "sleep", "infinity"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    def _inhibit(self):
+        self.inhibit_serial = self.bus.call(*self.LOGIN1, "Inhibit", "ssss", (
+            "sleep", "canon-scan-to-pc", "Removing this computer from the printer's scan list", "delay"))
 
-    def _release_lock(self):
-        if self.inhibitor is not None:
-            try:
-                os.killpg(self.inhibitor.pid, signal.SIGTERM)   # systemd-inhibit and its sleep
-            except ProcessLookupError:
-                pass
-            self.inhibitor.wait()
-            self.inhibitor = None
+    def _release(self):
+        if self.lock_fd is not None:
+            os.close(self.lock_fd)
+            self.lock_fd = None
 
     def run(self):
-        if not shutil.which("gdbus"):
-            log.warning("gdbus not found: won't sign off before sleep")
-            return
-        self._take_lock()
-        self.monitor = subprocess.Popen(
-            ["gdbus", "monitor", "--system", "--dest", "org.freedesktop.login1",
-             "--object-path", "/org/freedesktop/login1"],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
-        for line in self.monitor.stdout:
-            if "PrepareForSleep" not in line:
-                continue
-            if "(true,)" in line:
-                self.asleep.set()
-                self.printer.sign_off()
-                log.info("signed off before sleep")
-                self._release_lock()
-            elif "(false,)" in line:
-                self._take_lock()
-                self.asleep.clear()
-                log.info("woke up; registering again")
+        try:
+            self.bus = SystemBus()
+            self.bus.call("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "Hello")
+            self.bus.call("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
+                          "AddMatch", "s", ("type='signal',sender='org.freedesktop.login1',"
+                                            "interface='org.freedesktop.login1.Manager',"
+                                            "member='PrepareForSleep',path='/org/freedesktop/login1'",))
+            self._inhibit()
+            while True:
+                mtype, reply_serial, member, body, fds = self.bus.receive()
+                if mtype in (2, 3) and reply_serial == self.inhibit_serial:   # Inhibit's reply
+                    self.inhibit_serial = None
+                    if mtype == 2 and fds:
+                        self._release()
+                        self.lock_fd = fds.pop(0)
+                    else:
+                        log.warning("couldn't take a sleep inhibitor; sign-off before sleep may be late")
+                for fd in fds:
+                    os.close(fd)
+                if mtype == 4 and member == "PrepareForSleep" and len(body) >= 4:
+                    if struct.unpack("<I", body[:4])[0]:          # going to sleep
+                        self.asleep.set()
+                        self.printer.sign_off()
+                        log.info("signed off before sleep")
+                        self._release()
+                    else:                                           # woke up
+                        self._inhibit()
+                        self.asleep.clear()
+                        log.info("woke up; registering again")
+        except Exception as e:            # never take the service down with it
+            if self.bus is not None:      # not closed by stop()
+                log.warning("sleep handling stopped: %s", e)
+        finally:
+            self._release()
 
     def stop(self):
-        if self.monitor is not None:
-            self.monitor.terminate()
-        self._release_lock()
+        bus, self.bus = self.bus, None
+        if bus is not None:
+            bus.close()
 
 
 # ---------------------------------------------------------------- main loop
@@ -343,44 +643,33 @@ def load_config(path):
     return cfg
 
 
-def find_printer():
-    """The one Canon MFNP scanner on the network, or None (logging why)."""
-    printers = discover()
-    if len(printers) == 1:
-        log.info("found %s at %s", printers[0][1], printers[0][0])
-        return printers[0][0]
-    if len(printers) > 1:
-        log.error("found several Canon scanners (%s); set host in %s",
-                  ", ".join(f"{m} at {ip}" for ip, m in printers), CONFIG_PATH)
-    return None
-
-
 def run(cfg):
-    stopping = False
+    stop_event = threading.Event()
 
     def stop(*_):
-        nonlocal stopping
-        stopping = True
+        stop_event.set()
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
+    stopping = stop_event.is_set
 
     auto = not cfg["printer"]["host"].strip()
     host = cfg["printer"]["host"].strip()
     delay = KEEPALIVE_S
-    while auto and not host and not stopping:
+    while auto and not host and not stopping():
         host = find_printer()
         if not host:
             log.info("no Canon scanner found yet; looking again in %ss", delay)
-            _sleep(delay, lambda: stopping)
+            stop_event.wait(delay)
             delay = min(delay * 2, 300)
-    if stopping:
+    if stopping():
         return
     name = cfg["printer"]["name"].strip() or default_name()
     printer = Printer(host, name, getpass.getuser().capitalize())
 
-    # A dialog left over from a crash or power loss would sit in the printer's list.
+    # A registration left over from a crash or power loss would sit in the printer's list.
     try:
-        old_host, old = open(state_file()).read().split()
+        with open(state_file()) as f:
+            old_host, old = f.read().split()
         if old_host == host:
             printer.sign_off(int(old, 16))
             log.info("signed off leftover session %s", old)
@@ -392,19 +681,23 @@ def run(cfg):
 
     backoff = KEEPALIVE_S
     misses = 0
-    while not stopping:
+    while not stopping():
         if watcher.asleep.is_set():      # between PrepareForSleep and wake-up
-            _sleep(1, lambda: stopping)
+            stop_event.wait(1)
             continue
         if not printer.dialog:
             if printer.register():
-                open(state_file(), "w").write(f"{printer.host} {printer.dialog:#x}\n")
+                if watcher.asleep.is_set():   # sleep began while registering
+                    printer.sign_off()
+                    continue
+                with open(state_file(), "w") as f:
+                    f.write(f"{host} {printer.dialog:#x}\n")
                 log.info("registered with %s as %s (session %#x)", printer.host, name, printer.dialog)
                 backoff = KEEPALIVE_S
                 misses = 0
             else:
                 log.debug("printer not answering; retrying in %ss", backoff)
-                _sleep(backoff, lambda: stopping)
+                stop_event.wait(backoff)
                 if auto and backoff >= 40:   # several misses: the printer may have a new address
                     printer.host = find_printer() or printer.host
                 backoff = min(backoff * 2, 120)
@@ -416,14 +709,15 @@ def run(cfg):
         if status is None:
             misses += 1
             if misses >= 3:              # printer off/asleep or we were offline: start over
-                log.info("lost contact with the printer; will re-register")
-                printer.dialog = 0
-            _sleep(KEEPALIVE_S, lambda: stopping)
+                log.info("lost contact with the printer; registering again")
+                printer.sign_off()       # in case it's only the replies that were lost
+                misses = 0
+            stop_event.wait(KEEPALIVE_S)
             continue
         misses = 0
         if status == "lost":
-            log.info("printer dropped our session (reply %s); re-registering", raw.hex(" "))
-            printer.dialog = 0
+            log.info("printer dropped our session (reply %s); registering again", raw.hex(" "))
+            printer.sign_off()
             continue
         if status == "scan":
             code = f"{raw[16]:02x}" if len(raw) > 16 else "??"
@@ -436,14 +730,14 @@ def run(cfg):
                             code, raw.hex(" "), mode)
             printer.ack()
             try:
-                saved, n = scan(cfg, printer.host, mode)
+                saved, n = scan(cfg, printer.addr or printer.host, mode, stopping)
                 log.info("saved %d page(s): %s", n, ", ".join(saved))
                 notify(cfg, "Scan saved", "\n".join(os.path.basename(s) for s in saved))
             except Exception as e:      # keep the service alive whatever the scan does
                 log.error("scan failed: %s", e)
                 notify(cfg, "Scan failed", str(e)[:200])
             continue                     # poll again right away
-        _sleep(KEEPALIVE_S, lambda: stopping)
+        stop_event.wait(KEEPALIVE_S)
 
     watcher.stop()
     printer.sign_off()
@@ -454,13 +748,10 @@ def run(cfg):
     log.info("signed off")
 
 
-def _sleep(seconds, should_stop):
-    end = time.monotonic() + seconds
-    while time.monotonic() < end and not should_stop():
-        time.sleep(0.5)
-
-
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "--convert":    # internal: see convert()
+        return convert_main(sys.argv[2:])
+    import argparse
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("-c", "--config", default=CONFIG_PATH)
     ap.add_argument("-v", "--verbose", action="store_true")
@@ -486,8 +777,9 @@ def main():
             return 1
         saved, n = scan(cfg, host)
         print(f"saved {n} page(s): {', '.join(saved)}")
-        return
+        return 0
     run(cfg)
+    return 0
 
 
 if __name__ == "__main__":
