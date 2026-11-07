@@ -6,6 +6,8 @@ After=network-online.target graphical-session.target
 ExecStart=%h/.local/bin/canon-scan-to-pc
 Restart=on-failure
 RestartSec=15
+# exit code 2 = unreadable config: restarting won't help
+RestartPreventExitStatus=2
 
 [Install]
 WantedBy=default.target

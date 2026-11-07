@@ -317,7 +317,9 @@ def scan(cfg, host, mode=None, should_stop=lambda: False):
     stem = time.strftime("scan-%Y%m%d-%H%M%S")
     paper = sc.get("paper", "letter").lower()
 
-    with tempfile.TemporaryDirectory(prefix="canon-scan-") as tmp:
+    # Raw pages go under ~/.local/state, not /tmp: /tmp is RAM (tmpfs) on many distros.
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="scan-", dir=STATE_DIR) as tmp:
         for src in sources:
             sane_source = SANE_SOURCES.get(src, "Flatbed")
             cmd = ["scanimage", "-d", device, "--source", sane_source, "--mode", mode,
@@ -369,17 +371,28 @@ def convert_main(args):
     from PIL import Image
     fmt, res = args[0], float(args[1])
     if fmt == "pdf":
-        dest, pages = args[2], args[3:]
-        write_pdf(dest + ".part", pages, res)
-        os.replace(dest + ".part", dest)
+        jobs = [(args[2], None)]
+        pages = args[3:]
     else:
         sep = args.index("--")
-        for dest, page in zip(args[2:sep], args[sep + 1:]):
-            with Image.open(page) as im:
-                if im.mode not in ("L", "RGB"):
-                    im = im.convert("RGB")
-                im.save(dest + ".part", "JPEG", quality=90, dpi=(res, res))
-            os.replace(dest + ".part", dest)
+        jobs = list(zip(args[2:sep], args[sep + 1:]))
+    for dest, page in jobs:
+        part = dest + ".part"
+        try:
+            if page is None:
+                write_pdf(part, pages, res)
+            else:
+                with Image.open(page) as im:
+                    if im.mode not in ("L", "RGB"):
+                        im = im.convert("L" if im.mode == "1" else "RGB")
+                    im.save(part, "JPEG", quality=90, dpi=(res, res))
+            os.replace(part, dest)
+        except BaseException:
+            try:
+                os.remove(part)           # don't leave half-written files in the scan folder
+            except OSError:
+                pass
+            raise
     return 0
 
 
@@ -619,6 +632,8 @@ class SleepWatcher(threading.Thread):
                         self.lock_fd = fds.pop(0)
                     else:
                         log.warning("couldn't take a sleep inhibitor; sign-off before sleep may be late")
+                elif mtype == 3:
+                    log.warning("D-Bus call %s failed; sleep handling may not work", reply_serial)
                 for fd in fds:
                     os.close(fd)
                 if mtype == 4 and member == "PrepareForSleep" and len(body) >= 4:
@@ -637,6 +652,7 @@ class SleepWatcher(threading.Thread):
                 log.warning("sleep handling stopped: %s", e)
         finally:
             self._release()
+            self.asleep.clear()           # never leave the main loop waiting for a wake-up
 
     def stop(self):
         bus, self.bus = self.bus, None
@@ -696,10 +712,21 @@ def run(cfg):
 
     backoff = KEEPALIVE_S
     misses = 0
+    lost_streak = 0
+    last_request = None
+    asleep_since = None
     while not stopping():
         if watcher.asleep.is_set():      # between PrepareForSleep and wake-up
-            stop_event.wait(1)
-            continue
+            # The monotonic clock stops during suspend, so 30 s here means we're awake
+            # and missed the wake-up signal.
+            asleep_since = asleep_since or time.monotonic()
+            if time.monotonic() - asleep_since > 30:
+                log.warning("no wake-up signal after sleep; carrying on")
+                watcher.asleep.clear()
+            else:
+                stop_event.wait(1)
+                continue
+        asleep_since = None
         if not printer.dialog:
             if printer.register():
                 if watcher.asleep.is_set():   # sleep began while registering
@@ -733,8 +760,17 @@ def run(cfg):
         if status == "lost":
             log.info("printer dropped our session (reply %s); registering again", raw.hex(" "))
             printer.sign_off()
+            lost_streak += 1
+            if lost_streak > 1:          # keeps happening: don't flood the printer's list
+                stop_event.wait(min(KEEPALIVE_S * lost_streak, 300))
+            continue
+        lost_streak = 0
+        if status == "scan" and raw[8:16] == last_request:
+            printer.ack()                # the printer repeated a request we already handled
+            stop_event.wait(KEEPALIVE_S)
             continue
         if status == "scan":
+            last_request = raw[8:16]
             code = f"{raw[16]:02x}" if len(raw) > 16 else "??"
             mode = cfg["codes"].get(code)
             if mode:
@@ -776,7 +812,11 @@ def main():
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(levelname)s %(message)s" if os.environ.get("INVOCATION_ID")
                         else "%(asctime)s %(levelname)s %(message)s")
-    cfg = load_config(args.config)
+    try:
+        cfg = load_config(args.config)
+    except configparser.Error as e:
+        log.error("can't read %s: %s", args.config, e)
+        return 2                         # the systemd unit doesn't restart on exit code 2
     if args.discover:
         printers = discover()
         for ip, model in printers:
