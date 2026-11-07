@@ -84,7 +84,7 @@ class Printer:
             self.addr = None
         return self.addr
 
-    def _xchg(self, cmd, payload, tries=2):
+    def _xchg(self, cmd, payload, tries=2, timeout=3.0):
         """Send one command and return the matching reply's payload, or None."""
         with self.lock:
             if self.addr is None and self._resolve() is None:
@@ -94,7 +94,7 @@ class Printer:
             for _ in range(tries):
                 try:
                     self.sock.sendto(packet, (self.addr, PORT))
-                    deadline = time.monotonic() + 3
+                    deadline = time.monotonic() + timeout
                     while (left := deadline - time.monotonic()) > 0:
                         self.sock.settimeout(left)
                         data, addr = self.sock.recvfrom(4096)
@@ -109,9 +109,9 @@ class Printer:
                     return None
             return None
 
-    def _poll(self, ptype, dialog, tail, tries=2):
+    def _poll(self, ptype, dialog, tail, tries=2, timeout=3.0):
         head = struct.pack(">HHI", ptype, 0, dialog) + self.name.ljust(64, b"\0")
-        return self._xchg(0x32, head + tail, tries)
+        return self._xchg(0x32, head + tail, tries, timeout)
 
     def register(self):
         """discover, poll type 0, poll type 1; the type 1 reply carries our dialog id."""
@@ -144,12 +144,26 @@ class Printer:
     def ack(self):
         return self._poll(5, self.dialog, b"\0" * 8)
 
-    def sign_off(self, dialog=None):
-        """Remove a registration (ours by default) from the printer's list."""
+    def sign_off(self, dialog=None, quick=False):
+        """Remove a registration (ours by default) from the printer's list. quick: one
+        short try, to stay inside logind's sleep delay (5 s by default)."""
         if dialog is None:
             dialog, self.dialog = self.dialog, 0
-        if dialog:
+        if not dialog:
+            return
+        if not quick:
             self._poll(4, dialog, b"\0" * 8)
+            return
+        # Own socket, no lock: the main thread may be waiting on a keep-alive reply.
+        payload = struct.pack(">HHI", 4, 0, dialog) + self.name.ljust(64, b"\0") + b"\0" * 8
+        if self.addr:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.settimeout(1.5)
+                try:
+                    s.sendto(mfnp_header(0x32, 0xFFFF, len(payload)) + payload, (self.addr, PORT))
+                    s.recvfrom(4096)
+                except OSError:
+                    pass
 
 
 def mfnp_identity(host, timeout=2):
@@ -610,8 +624,9 @@ class SleepWatcher(threading.Thread):
                 if mtype == 4 and member == "PrepareForSleep" and len(body) >= 4:
                     if struct.unpack("<I", body[:4])[0]:          # going to sleep
                         self.asleep.set()
-                        self.printer.sign_off()
-                        log.info("signed off before sleep")
+                        t0 = time.monotonic()
+                        self.printer.sign_off(quick=True)
+                        log.info("signed off before sleep (%.1f s)", time.monotonic() - t0)
                         self._release()
                     else:                                           # woke up
                         self._inhibit()
