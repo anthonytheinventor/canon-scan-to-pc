@@ -1,0 +1,494 @@
+#!/usr/bin/env python3
+"""canon-scan-to-pc: "Scan → Computer" from a Canon imageCLASS/i-SENSYS panel to a Linux folder.
+
+Registers this computer with the printer the way Canon's Windows MF Scan Utility does
+(MFNP over UDP 8610), keeps the registration alive, and when someone picks this computer
+on the printer's panel and presses Start, fetches the scan with SANE's pixma backend and
+saves it (PDF by default) to the output folder.
+
+Protocol notes come from packet captures of the Windows utility; see README.md.
+"""
+import argparse
+import configparser
+import getpass
+import logging
+import os
+import re
+import shutil
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.request
+
+PORT = 8610
+KEEPALIVE_S = 10
+CONFIG_PATH = os.path.expanduser("~/.config/canon-scan-to-pc/config.ini")
+STATE_DIR = os.path.expanduser("~/.local/state/canon-scan-to-pc")
+SANE_DIR = os.path.join(STATE_DIR, "sane")
+
+def default_name():
+    """This computer's host name, in the form the printer's list can show (ASCII, 15 chars)."""
+    name = re.sub(r"[^A-Z0-9-]", "", socket.gethostname().split(".")[0].upper())
+    return name[:15] or "LINUX-PC"
+
+
+DEFAULTS = {
+    "printer": {"host": "", "name": ""},  # empty host = find the printer on the network
+    "scan": {
+        "output_dir": "~/Scans",
+        "format": "pdf",          # pdf, png or jpeg
+        "mode": "Color",          # Color, Gray or Lineart
+        "resolution": "300",      # 75, 150, 300 or 600
+        "source": "auto",         # auto (feeder if loaded, else glass), flatbed, adf, adf-duplex
+        "paper": "letter",        # letter, legal, a4 or full (whole scan area)
+        "notify": "yes",
+    },
+    # The printer's colour choice arrives as a code byte with the scan request.
+    # Unknown codes fall back to [scan] mode and are logged so they can be added here.
+    "codes": {"01": "Color", "02": "Gray"},
+}
+
+PAPER_MM = {"letter": (215.9, 279.4), "legal": (215.9, 355.6), "a4": (210.0, 297.0)}
+
+log = logging.getLogger("canon-scan-to-pc")
+
+
+# ---------------------------------------------------------------- protocol
+
+class Printer:
+    """The MFNP poll dialog with one printer."""
+
+    def __init__(self, host, name, user):
+        self.host = host
+        self.name = name.encode("ascii", "replace")[:63]
+        self.user_host = f"{user}  {name}".encode("ascii", "replace")[:194]
+        self.seq = 0
+        self.dialog = 0
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.settimeout(3)
+        self.lock = threading.Lock()     # the sleep watcher signs off from another thread
+
+    def _xchg(self, cmd, payload):
+        with self.lock:
+            return self._xchg_locked(cmd, payload)
+
+    def _xchg_locked(self, cmd, payload):
+        self.seq = (self.seq + 1) & 0xFFFF
+        packet = struct.pack(">4sBBhHHI", b"MFNP", 0x02, cmd, 0, self.seq, 0, len(payload)) + payload
+        for _ in range(2):
+            try:
+                self.sock.sendto(packet, (self.host, PORT))
+                while True:
+                    data, addr = self.sock.recvfrom(4096)
+                    if addr[0] != self.host or len(data) < 16 or data[:4] != b"MFNP":
+                        continue
+                    if struct.unpack(">H", data[8:10])[0] != self.seq:
+                        continue          # a late reply to an earlier packet
+                    return data[16:]
+            except socket.timeout:
+                continue
+            except OSError as e:         # network down (suspend, Wi-Fi switch)
+                log.debug("send failed: %s", e)
+                return None
+        return None
+
+    def _poll(self, ptype, dialog, tail):
+        head = struct.pack(">HHI", ptype, 0, dialog) + self.name.ljust(64, b"\0")
+        return self._xchg(0x32, head + tail)
+
+    def register(self):
+        """discover, poll type 0, poll type 1; the type 1 reply carries our dialog id."""
+        if self._xchg(0x01, b"") is None:
+            return False
+        if self._poll(0, 0, b"\0" * 8) is None:
+            return False
+        r = self._poll(1, 0, struct.pack(">II", 0, 195) + self.user_host.ljust(195, b"\0"))
+        if r is None or len(r) < 8:
+            return False
+        self.dialog = struct.unpack(">I", r[4:8])[0]
+        return self.dialog != 0
+
+    def keepalive(self):
+        """Poll type 2. Returns None (no answer), 'ok', 'scan' or 'lost'."""
+        stamp = time.strftime("%Y%m%d%H%M%S").encode().ljust(16, b"\0")
+        r = self._poll(2, self.dialog, struct.pack(">II", 0, 0x10) + stamp)
+        if r is None or len(r) < 8:
+            return None, b""
+        if struct.unpack(">I", r[4:8])[0] != self.dialog:
+            return "lost", r
+        if r[2] & 0x80:
+            return "scan", r
+        if r[3] == 3:
+            return "ok", r
+        return "lost", r
+
+    def ack(self):
+        return self._poll(5, self.dialog, b"\0" * 8)
+
+    def sign_off(self, dialog=None):
+        dialog = self.dialog if dialog is None else dialog
+        if dialog:
+            self._poll(4, dialog, b"\0" * 8)
+        if dialog == self.dialog:
+            self.dialog = 0
+
+
+def mfnp_identity(host, timeout=2):
+    """Ask a host for its MFNP identity (IEEE 1284 string); None if it doesn't speak MFNP."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(timeout)
+    try:
+        s.sendto(struct.pack(">4sBBhHHI", b"MFNP", 0x02, 0x30, 0, 1, 0, 0), (host, PORT))
+        data, _ = s.recvfrom(4096)
+    except OSError:
+        return None
+    finally:
+        s.close()
+    if data[:4] != b"MFNP":
+        return None
+    return data[16:].split(b"\0")[0].decode("latin-1", "replace")
+
+
+def discover():
+    """Canon scanners on the local network: [(ip, model)].
+
+    Canon printers announce themselves over mDNS/DNS-SD (as AirPrint printers); each Canon
+    with a scanner is then asked directly whether it speaks MFNP. Needs avahi-browse.
+    """
+    if not shutil.which("avahi-browse"):
+        log.error("avahi-browse not found (package avahi-utils); set host in the config instead")
+        return []
+    try:
+        out = subprocess.run(["avahi-browse", "-rtp", "_ipp._tcp"], capture_output=True,
+                             text=True, timeout=20).stdout
+    except subprocess.TimeoutExpired:
+        return []
+    found = {}
+    for line in out.splitlines():
+        f = line.split(";")
+        if len(f) < 10 or f[0] != "=" or f[2] != "IPv4":
+            continue
+        txt = f[9]
+        if '"usb_MFG=Canon"' not in txt or '"Scan=T"' not in txt or f[7] in found:
+            continue
+        ident = mfnp_identity(f[7])
+        if ident:
+            m = re.search(r"MDL:([^;]*)", ident)
+            found[f[7]] = m.group(1) if m else "Canon"
+    return sorted(found.items())
+
+
+# ---------------------------------------------------------------- scanning
+
+def sane_device(host):
+    """A private SANE config that only loads pixma, pointed straight at the printer."""
+    os.makedirs(SANE_DIR, exist_ok=True)
+    with open(os.path.join(SANE_DIR, "dll.conf"), "w") as f:
+        f.write("pixma\n")
+    with open(os.path.join(SANE_DIR, "pixma.conf"), "w") as f:
+        f.write(f"mfnp://{host}/timeout=5000\n")
+    env = dict(os.environ, SANE_CONFIG_DIR=SANE_DIR)
+    out = subprocess.run(["scanimage", "-f", "%d%n"], env=env, capture_output=True, text=True, timeout=60)
+    devices = [d for d in out.stdout.split() if d.startswith("pixma:")]
+    return (devices[0] if devices else None), env
+
+
+def feeder_loaded(host):
+    """Ask the printer's eSCL status page whether pages are in the document feeder."""
+    try:
+        with urllib.request.urlopen(f"http://{host}/eSCL/ScannerStatus", timeout=5) as r:
+            body = r.read().decode("utf-8", "replace")
+    except OSError:
+        return False
+    m = re.search(r"<scan:AdfState>([^<]*)<", body)
+    return bool(m) and m.group(1) == "ScannerAdfLoaded"
+
+
+def scan(cfg, host, mode=None):
+    sc = cfg["scan"]
+    mode = mode or sc.get("mode", "Color")
+    device, env = sane_device(host)
+    if not device:
+        raise RuntimeError("SANE's pixma backend did not find the printer")
+    source = sc.get("source", "auto").lower()
+    if source == "auto":
+        source = "adf" if feeder_loaded(host) else "flatbed"
+    sane_source = {"flatbed": "Flatbed", "adf": "Automatic Document Feeder",
+                   "adf-duplex": "ADF Duplex"}.get(source, "Flatbed")
+    fmt = sc.get("format", "pdf").lower()
+    outdir = os.path.expanduser(sc.get("output_dir", "~/Scans"))
+    os.makedirs(outdir, exist_ok=True)
+    stamp = time.strftime("scan-%Y%m%d-%H%M%S")
+
+    with tempfile.TemporaryDirectory(prefix="canon-scan-") as tmp:
+        cmd = ["scanimage", "-d", device, "--source", sane_source, "--mode", mode,
+               "--resolution", sc.get("resolution", "300"), "--format=png",
+               f"--batch={tmp}/page-%03d.png"]
+        paper = sc.get("paper", "letter").lower()
+        if paper in PAPER_MM:
+            w, h = PAPER_MM[paper]
+            cmd += ["-l", "0", "-t", "0", "-x", str(w), "-y", str(h)]
+        if sane_source == "Flatbed":
+            cmd.append("--batch-count=1")
+        log.info("scanning: %s, %s, %s dpi, %s", sane_source, mode, sc.get("resolution"), paper)
+        p = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=900)
+        pages = sorted(f for f in os.listdir(tmp) if f.endswith(".png") and os.path.getsize(os.path.join(tmp, f)))
+        if not pages:
+            raise RuntimeError(f"scanimage produced no pages (exit {p.returncode}): {p.stderr.strip()[-300:]}")
+        pages = [os.path.join(tmp, f) for f in pages]
+        saved = []
+        if fmt == "pdf":
+            from PIL import Image
+            images = [Image.open(f).convert("RGB") for f in pages]
+            dest = os.path.join(outdir, stamp + ".pdf")
+            images[0].save(dest, save_all=True, append_images=images[1:],
+                           resolution=float(sc.get("resolution", "300")))
+            saved.append(dest)
+        else:
+            ext = "jpg" if fmt in ("jpeg", "jpg") else "png"
+            for i, f in enumerate(pages, 1):
+                suffix = f"-{i}" if len(pages) > 1 else ""
+                dest = os.path.join(outdir, f"{stamp}{suffix}.{ext}")
+                if ext == "png":
+                    shutil.move(f, dest)
+                else:
+                    from PIL import Image
+                    Image.open(f).convert("RGB").save(dest, quality=90)
+                saved.append(dest)
+    return saved, len(pages)
+
+
+def notify(cfg, summary, body=""):
+    if cfg["scan"].getboolean("notify", True) and shutil.which("notify-send"):
+        subprocess.run(["notify-send", "-a", "Canon Scan", "-i", "scanner", summary, body], check=False)
+
+
+# ---------------------------------------------------------------- sleep handling
+
+class SleepWatcher(threading.Thread):
+    """Signs off before the computer sleeps, so the printer's list never shows a computer
+    that can't answer, and lets the main loop register again after wake-up.
+
+    Listens to logind's PrepareForSleep signal and holds a "delay" sleep inhibitor, which
+    makes logind wait (up to InhibitDelayMaxSec, 5 s by default) until the sign-off is sent.
+    """
+
+    def __init__(self, printer):
+        super().__init__(daemon=True, name="sleep-watcher")
+        self.printer = printer
+        self.asleep = threading.Event()
+        self.inhibitor = None
+        self.monitor = None
+
+    def _take_lock(self):
+        if self.inhibitor is None and shutil.which("systemd-inhibit"):
+            self.inhibitor = subprocess.Popen(
+                ["systemd-inhibit", "--what=sleep", "--mode=delay", "--who=canon-scan-to-pc",
+                 "--why=Removing this computer from the printer's scan list", "sleep", "infinity"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+
+    def _release_lock(self):
+        if self.inhibitor is not None:
+            try:
+                os.killpg(self.inhibitor.pid, signal.SIGTERM)   # systemd-inhibit and its sleep
+            except ProcessLookupError:
+                pass
+            self.inhibitor.wait()
+            self.inhibitor = None
+
+    def run(self):
+        if not shutil.which("gdbus"):
+            log.warning("gdbus not found: won't sign off before sleep")
+            return
+        self._take_lock()
+        self.monitor = subprocess.Popen(
+            ["gdbus", "monitor", "--system", "--dest", "org.freedesktop.login1",
+             "--object-path", "/org/freedesktop/login1"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        for line in self.monitor.stdout:
+            if "PrepareForSleep" not in line:
+                continue
+            if "(true,)" in line:
+                self.asleep.set()
+                self.printer.sign_off()
+                log.info("signed off before sleep")
+                self._release_lock()
+            elif "(false,)" in line:
+                self._take_lock()
+                self.asleep.clear()
+                log.info("woke up; registering again")
+
+    def stop(self):
+        if self.monitor is not None:
+            self.monitor.terminate()
+        self._release_lock()
+
+
+# ---------------------------------------------------------------- main loop
+
+def state_file():
+    os.makedirs(STATE_DIR, exist_ok=True)
+    return os.path.join(STATE_DIR, "dialog")
+
+
+def load_config(path):
+    cfg = configparser.ConfigParser()
+    cfg.read_dict(DEFAULTS)
+    cfg.read(path)
+    return cfg
+
+
+def find_printer():
+    """The one Canon MFNP scanner on the network, or None (logging why)."""
+    printers = discover()
+    if len(printers) == 1:
+        log.info("found %s at %s", printers[0][1], printers[0][0])
+        return printers[0][0]
+    if len(printers) > 1:
+        log.error("found several Canon scanners (%s); set host in %s",
+                  ", ".join(f"{m} at {ip}" for ip, m in printers), CONFIG_PATH)
+    return None
+
+
+def run(cfg):
+    stopping = False
+
+    def stop(*_):
+        nonlocal stopping
+        stopping = True
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+
+    auto = not cfg["printer"]["host"].strip()
+    host = cfg["printer"]["host"].strip()
+    delay = KEEPALIVE_S
+    while auto and not host and not stopping:
+        host = find_printer()
+        if not host:
+            log.info("no Canon scanner found yet; looking again in %ss", delay)
+            _sleep(delay, lambda: stopping)
+            delay = min(delay * 2, 300)
+    if stopping:
+        return
+    name = cfg["printer"]["name"].strip() or default_name()
+    printer = Printer(host, name, getpass.getuser().capitalize())
+
+    # A dialog left over from a crash or power loss would sit in the printer's list.
+    try:
+        old_host, old = open(state_file()).read().split()
+        if old_host == host:
+            printer.sign_off(int(old, 16))
+            log.info("signed off leftover session %s", old)
+    except (OSError, ValueError):
+        pass
+
+    watcher = SleepWatcher(printer)
+    watcher.start()
+
+    backoff = KEEPALIVE_S
+    misses = 0
+    while not stopping:
+        if watcher.asleep.is_set():      # between PrepareForSleep and wake-up
+            _sleep(1, lambda: stopping)
+            continue
+        if not printer.dialog:
+            if printer.register():
+                open(state_file(), "w").write(f"{printer.host} {printer.dialog:#x}\n")
+                log.info("registered with %s as %s (session %#x)", printer.host, name, printer.dialog)
+                backoff = KEEPALIVE_S
+                misses = 0
+            else:
+                log.debug("printer not answering; retrying in %ss", backoff)
+                _sleep(backoff, lambda: stopping)
+                if auto and backoff >= 40:   # several misses: the printer may have a new address
+                    printer.host = find_printer() or printer.host
+                backoff = min(backoff * 2, 120)
+                continue
+
+        status, raw = printer.keepalive()
+        if watcher.asleep.is_set():      # signed off while this poll was in flight
+            continue
+        if status is None:
+            misses += 1
+            if misses >= 3:              # printer off/asleep or we were offline: start over
+                log.info("lost contact with the printer; will re-register")
+                printer.dialog = 0
+            _sleep(KEEPALIVE_S, lambda: stopping)
+            continue
+        misses = 0
+        if status == "lost":
+            log.info("printer dropped our session (reply %s); re-registering", raw.hex(" "))
+            printer.dialog = 0
+            continue
+        if status == "scan":
+            code = f"{raw[16]:02x}" if len(raw) > 16 else "??"
+            mode = cfg["codes"].get(code)
+            if mode:
+                log.info("scan requested at the printer (code %s: %s)", code, mode)
+            else:
+                mode = cfg["scan"].get("mode", "Color")
+                log.warning("scan requested with unknown code %s (full reply %s); using %s",
+                            code, raw.hex(" "), mode)
+            printer.ack()
+            try:
+                saved, n = scan(cfg, printer.host, mode)
+                log.info("saved %d page(s): %s", n, ", ".join(saved))
+                notify(cfg, "Scan saved", "\n".join(os.path.basename(s) for s in saved))
+            except Exception as e:      # keep the service alive whatever the scan does
+                log.error("scan failed: %s", e)
+                notify(cfg, "Scan failed", str(e)[:200])
+            continue                     # poll again right away
+        _sleep(KEEPALIVE_S, lambda: stopping)
+
+    watcher.stop()
+    printer.sign_off()
+    try:
+        os.remove(state_file())
+    except OSError:
+        pass
+    log.info("signed off")
+
+
+def _sleep(seconds, should_stop):
+    end = time.monotonic() + seconds
+    while time.monotonic() < end and not should_stop():
+        time.sleep(0.5)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("-c", "--config", default=CONFIG_PATH)
+    ap.add_argument("-v", "--verbose", action="store_true")
+    ap.add_argument("--scan-now", action="store_true", help="scan once with the configured settings and exit")
+    ap.add_argument("--discover", action="store_true", help="list Canon scanners found on the network and exit")
+    args = ap.parse_args()
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
+                        format="%(levelname)s %(message)s" if os.environ.get("INVOCATION_ID")
+                        else "%(asctime)s %(levelname)s %(message)s")
+    cfg = load_config(args.config)
+    if args.discover:
+        printers = discover()
+        for ip, model in printers:
+            print(f"{ip}\t{model}")
+        if not printers:
+            print("no Canon MFNP scanners found", file=sys.stderr)
+            return 1
+        return 0
+    if args.scan_now:
+        host = cfg["printer"]["host"].strip() or find_printer()
+        if not host:
+            print("no printer found; set host in the config", file=sys.stderr)
+            return 1
+        saved, n = scan(cfg, host)
+        print(f"saved {n} page(s): {', '.join(saved)}")
+        return
+    run(cfg)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
