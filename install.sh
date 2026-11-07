@@ -19,12 +19,14 @@ fi
 missing=""
 command -v scanimage >/dev/null || missing="$missing sane-utils"
 python3 -c 'import PIL' 2>/dev/null || missing="$missing python3-pil"
-command -v avahi-browse >/dev/null || missing="$missing avahi-utils"
 if [ -n "$missing" ]; then
     echo "Missing packages:$missing"
     echo "On Debian, Ubuntu or Mint:  sudo apt install$missing"
-    echo "(avahi-utils is only needed to find the printer automatically)"
     exit 1
+fi
+if ! command -v avahi-browse >/dev/null; then
+    echo "Note: avahi-browse (package avahi-utils) isn't installed, so the printer can't be"
+    echo "found automatically. Install it, or set host in $CONF_DIR/config.ini."
 fi
 
 mkdir -p "$(dirname "$BIN")" "$CONF_DIR" "$UNIT_DIR"
@@ -38,9 +40,12 @@ install -m 644 "$HERE/canon-scan-to-pc.service" "$UNIT"
 systemctl --user daemon-reload
 
 echo "Looking for Canon scanners on the network..."
-"$BIN" --discover || echo "None found yet. Is the printer on? You can set host in $CONF_DIR/config.ini."
+if command -v avahi-browse >/dev/null; then
+    "$BIN" --discover || echo "None found yet. Is the printer on? You can set host in $CONF_DIR/config.ini."
+fi
 
-systemctl --user enable --now canon-scan-to-pc
+systemctl --user enable canon-scan-to-pc
+systemctl --user restart canon-scan-to-pc     # starts it, or picks up a newer version
 echo
 echo "Installed and running. On the printer: Scan > Computer > pick this computer > Start."
 echo "Scans are saved to ~/Scans. Log:  journalctl --user -u canon-scan-to-pc -f"

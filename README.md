@@ -73,9 +73,11 @@ Edit `~/.config/canon-scan-to-pc/config.ini`, then run `systemctl --user restart
 | `name` | your computer's host name | what the printer's list shows (ASCII, at most 15 characters) |
 | `output_dir` | `~/Scans` | any folder |
 | `format` | `pdf` | `pdf` (all pages in one file), `png`, `jpeg` |
+| `mode` | `Color` | `Color`, `Gray`, `Lineart`: used when the printer sends a color choice that isn't in `[codes]` |
 | `resolution` | `300` | `75`, `150`, `300`, `600` |
 | `source` | `auto` | `auto` (feeder if pages are loaded, else glass), `flatbed`, `adf`, `adf-duplex` |
 | `paper` | `letter` | `letter`, `legal`, `a4`, `full` |
+| `notify` | `yes` | `no` turns off the desktop notification |
 | `[codes]` | `01 = Color`, `02 = Gray` | maps the printer's color choice to `Color`, `Gray` or `Lineart` |
 
 Other commands:
@@ -91,7 +93,8 @@ journalctl --user -u canon-scan-to-pc -f    # watch what it's doing
 **My computer doesn't appear in the printer's list.**
 Check the log (`journalctl --user -u canon-scan-to-pc`). It should say `registered with
 <printer> as <NAME>`. If it says no scanner was found, set `host` in the config. The printer
-must be reachable on UDP and TCP port 8610.
+must be reachable on UDP and TCP port 8610, and on TCP port 80 for `source = auto`
+(the feeder check).
 
 **The printer says it's waiting, and nothing happens.**
 You probably picked an old entry. If the computer lost power or crashed, its old entry can

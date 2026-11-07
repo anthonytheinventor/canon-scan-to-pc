@@ -1,6 +1,5 @@
 [Unit]
 Description=Canon "Scan to Computer" receiver (MFNP push scan)
-After=network-online.target graphical-session.target
 
 [Service]
 ExecStart=%h/.local/bin/canon-scan-to-pc
