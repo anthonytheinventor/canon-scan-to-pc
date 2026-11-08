@@ -496,19 +496,64 @@ def notify(cfg, summary, body="", path=None):
             log.debug("notification failed: %s", e)
         return
     threading.Thread(target=_notify_with_actions, daemon=True, name="notify",
-                     args=(cmd + ["--action=open=Open", "--action=folder=Show in folder"], path)).start()
+                     args=(cmd, path)).start()
+
+
+# Only the newest "Scan saved" notification keeps its buttons: each waiting notify-send
+# is a ~6 MB process, and some desktops (Cinnamon) keep it waiting until the notification
+# is dismissed from the tray.
+_notify_lock = threading.Lock()
+_notify_waiting = None
+NOTIFY_WAIT_S = 3600
 
 
 def _notify_with_actions(cmd, path):
+    global _notify_waiting
     try:
-        # Returns when the notification is clicked, dismissed or expires.
-        choice = subprocess.run(cmd, capture_output=True, text=True, timeout=24 * 3600).stdout.strip()
-        if choice == "open":
-            subprocess.Popen(["xdg-open", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        elif choice == "folder":
-            show_in_folder(path)
-    except (OSError, subprocess.SubprocessError) as e:
+        p = subprocess.Popen(cmd + ["--action=open=Open", "--action=folder=Show in folder"],
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    except OSError as e:
         log.debug("notification failed: %s", e)
+        return
+    with _notify_lock:
+        old, _notify_waiting = _notify_waiting, p
+    if old and old.poll() is None:
+        old.terminate()
+    try:
+        choice = p.communicate(timeout=NOTIFY_WAIT_S)[0].strip()
+    except subprocess.TimeoutExpired:
+        p.kill()
+        p.wait()
+        return
+    finally:
+        with _notify_lock:
+            if _notify_waiting is p:
+                _notify_waiting = None
+    if p.returncode > 0:
+        # notify-send before libnotify 0.7.10 (Ubuntu 22.04, Debian 11) has no --action
+        try:
+            subprocess.run(cmd, timeout=10, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except (OSError, subprocess.SubprocessError) as e:
+            log.debug("notification failed: %s", e)
+    elif choice == "open":
+        launch(["xdg-open", path])
+    elif choice == "folder":
+        show_in_folder(path)
+
+
+def launch(cmd):
+    """Start a desktop program (a document viewer, the file manager) in its own systemd
+    scope. Started directly, it would belong to this service, and systemd would close it
+    whenever the service stops or restarts (say, after Save in the settings window)."""
+    try:
+        if shutil.which("systemd-run"):
+            r = subprocess.run(["systemd-run", "--user", "--scope", "--quiet", "--collect", "--", *cmd],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if r.returncode == 0:
+                return
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError as e:
+        log.debug("couldn't start %s: %s", cmd[0], e)
 
 
 def show_in_folder(path):
@@ -525,15 +570,17 @@ def show_in_folder(path):
             return
     except (OSError, subprocess.SubprocessError):
         pass
-    subprocess.Popen(["xdg-open", os.path.dirname(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    launch(["xdg-open", os.path.dirname(path)])
 
 
 def record_scan(**info):
     """Remember the last scan for --status and the settings window."""
     try:
         os.makedirs(STATE_DIR, exist_ok=True)
-        with open(os.path.join(STATE_DIR, "last-scan.json"), "w") as f:
+        path = os.path.join(STATE_DIR, "last-scan.json")
+        with open(path + ".tmp", "w") as f:
             json.dump(dict(info, time=time.strftime("%Y-%m-%d %H:%M:%S")), f)
+        os.replace(path + ".tmp", path)      # readers never see a half-written file
     except OSError as e:
         log.debug("couldn't record the scan: %s", e)
 
@@ -769,7 +816,7 @@ def state_file(name):
 
 
 def load_config(path):
-    cfg = configparser.ConfigParser()
+    cfg = configparser.ConfigParser(interpolation=None)    # a "%" in a folder name is just a "%"
     cfg.read_dict(DEFAULTS)
     cfg.read(path)
     return cfg
@@ -982,7 +1029,7 @@ def main():
     ap.add_argument("--scan-now", action="store_true", help="scan once with the configured settings and exit")
     ap.add_argument("--discover", action="store_true", help="list Canon scanners found on the network and exit")
     ap.add_argument("--status", action="store_true", help="show what the service is doing and exit")
-    ap.add_argument("--json", action="store_true", help="with --status: machine-readable output")
+    ap.add_argument("--json", action="store_true", help="with --status or --scan-now: machine-readable output")
     ap.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     args = ap.parse_args()
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
@@ -1009,6 +1056,9 @@ def main():
             print("no printer found; set host in the config", file=sys.stderr)
             return 1
         saved, n, partial = scan(cfg, host)
+        if args.json:
+            print(json.dumps({"files": saved, "pages": n, "partial": partial}))
+            return 0
         print(f"saved {n} page(s){' (incomplete)' if partial else ''}: {', '.join(saved)}")
         return 0
     run(cfg)

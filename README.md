@@ -18,12 +18,14 @@ is saved to `~/Scans` as a PDF, with a desktop notification that can open it.
 - Finds the printer on the network by itself
 - A settings window (in your applications menu as **Canon Scan to PC**) for the printer,
   folder, file format, resolution and paper size, with status and a test scan
-- Notifications with **Open** and **Show in folder** buttons
+- Notifications with **Open** and **Show in folder** buttons (needs libnotify 0.7.10 or newer;
+  older systems get a plain notification)
 - Removes itself from the printer's list when the computer sleeps or shuts down, and
   comes back on wake-up
 - No root, no Canon software, no build step: one Python file plus a systemd user service
 - Light: one process, about 10 MB of memory, and practically no CPU while idle (one tiny
-  network packet every 10 seconds). Scans are converted in a short-lived helper process, a
+  network packet every 10 seconds; the newest notification's buttons stay usable for an hour,
+  which adds about 6 MB). Scans are converted in a short-lived helper process, a
   page at a time, so even long feeder scans don't make the service grow
 
 This is a reimplementation of Canon's network protocol (MFNP), worked out from packet

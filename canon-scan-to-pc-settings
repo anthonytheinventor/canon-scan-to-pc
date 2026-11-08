@@ -16,7 +16,7 @@ import threading
 
 import gi
 gi.require_version("Gtk", "3.0")
-from gi.repository import GLib, Gtk  # noqa: E402
+from gi.repository import Gio, GLib, Gtk  # noqa: E402
 
 APP = "canon-scan-to-pc"
 SERVICE = "canon-scan-to-pc"
@@ -87,16 +87,25 @@ notify = {notify}
 """
 
 
-def load_config():
-    cfg = configparser.ConfigParser()
+def defaults():
+    cfg = configparser.ConfigParser(interpolation=None)    # a "%" in a folder name is just a "%"
     cfg.read_dict({
         "printer": {"host": "", "name": ""},
         "scan": {"output_dir": "~/Scans", "format": "pdf", "mode": "Color", "resolution": "300",
                  "source": "auto", "paper": "letter", "notify": "yes"},
         "codes": {"01": "Color", "02": "Gray"},
     })
-    cfg.read(CONFIG_PATH)
     return cfg
+
+
+def load_config():
+    """The settings, and an error message if the file couldn't be read (defaults are used)."""
+    cfg = defaults()
+    try:
+        cfg.read(CONFIG_PATH)
+    except configparser.Error as e:
+        return defaults(), f"Couldn't read the settings file ({str(e).splitlines()[0]}) Save replaces it."
+    return cfg, None
 
 
 def write_config(path, values, codes):
@@ -118,9 +127,37 @@ def combo(choices, current):
     box = Gtk.ComboBoxText()
     for value, label in choices:
         box.append(value, label)
-    if not box.set_active_id(current):
+    if current and not box.set_active_id(current):
+        box.append(current, current)    # a value set by hand: keep it rather than change it
+        box.set_active_id(current)
+    elif not current:
         box.set_active(0)
     return box
+
+
+def open_file(path):
+    """Open a file with its default app (no child process to clean up)."""
+    try:
+        Gio.AppInfo.launch_default_for_uri(Gio.File.new_for_path(path).get_uri(), None)
+    except GLib.Error:
+        subprocess.Popen(["xdg-open", path])
+
+
+def show_in_folder(path):
+    """The file manager with the file selected (FileManager1 over D-Bus), or the folder."""
+    def done(bus, result):
+        try:
+            bus.call_finish(result)
+        except GLib.Error:
+            open_file(os.path.dirname(path))
+    try:
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION)
+        bus.call("org.freedesktop.FileManager1", "/org/freedesktop/FileManager1",
+                 "org.freedesktop.FileManager1", "ShowItems",
+                 GLib.Variant("(ass)", ([Gio.File.new_for_path(path).get_uri()], "")),
+                 None, Gio.DBusCallFlags.NONE, 10000, None, done)
+    except GLib.Error:
+        open_file(os.path.dirname(path))
 
 
 class Window(Gtk.ApplicationWindow):
@@ -128,10 +165,10 @@ class Window(Gtk.ApplicationWindow):
         super().__init__(application=app, title="Canon Scan to PC")
         self.set_default_size(560, -1)
         self.set_icon_name("scanner")
-        self.cfg = load_config()
+        self.cfg, config_error = load_config()
 
-        header = Gtk.HeaderBar(title="Canon Scan to PC", show_close_button=True)
-        self.set_titlebar(header)
+        # A normal title bar drawn by the window manager (not a GTK header bar), so the
+        # window gets the desktop's own frame, height and effects like other apps.
 
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, margin=14)
         self.add(outer)
@@ -190,7 +227,10 @@ class Window(Gtk.ApplicationWindow):
         s = self.cfg["scan"]
         self.folder = Gtk.FileChooserButton(title="Save scans to", action=Gtk.FileChooserAction.SELECT_FOLDER)
         out = os.path.expanduser(s.get("output_dir", "~/Scans"))
-        os.makedirs(out, exist_ok=True)
+        try:
+            os.makedirs(out, exist_ok=True)
+        except OSError:
+            pass                              # shown as "(None)"; the service reports the error
         self.folder.set_filename(out)
         add("Save scans to", self.folder)
 
@@ -231,7 +271,12 @@ class Window(Gtk.ApplicationWindow):
         outer.pack_start(buttons, False, False, 0)
 
         self.last_files = []
+        self.refreshing = False
+        if config_error:
+            self.message.set_text(config_error)
         self.refresh_status()
+        # Coming back to the window (say, after scanning at the printer) shows the new status.
+        self.connect("notify::is-active", lambda *_: self.is_active() and self.refresh_status())
 
     # ---------------------------------------------------------------- helpers
 
@@ -248,7 +293,7 @@ class Window(Gtk.ApplicationWindow):
     def values(self):
         name = "".join(c for c in self.name.get_text().upper() if c.isascii() and (c.isalnum() or c == "-"))
         return {
-            "host": self.host.get_child().get_text().split(" ")[0].strip(),
+            "host": (self.host.get_child().get_text().split() or [""])[0],
             "name": name[:15],
             "output_dir": tilde(self.folder.get_filename() or os.path.expanduser("~/Scans")),
             "format": self.format.get_active_id(),
@@ -276,12 +321,17 @@ class Window(Gtk.ApplicationWindow):
     # ---------------------------------------------------------------- status
 
     def refresh_status(self):
+        if self.refreshing:
+            return
+        self.refreshing = True
+
         def work():
             code, out, err = run_program("--status", "--json", timeout=30)
             return json.loads(out) if code == 0 else RuntimeError(err.strip() or "no status")
         self.in_background(work, self.show_status)
 
     def show_status(self, st):
+        self.refreshing = False
         if isinstance(st, Exception):
             self.status_label.set_text(f"Couldn't read the status: {st}")
             return False
@@ -292,6 +342,8 @@ class Window(Gtk.ApplicationWindow):
                 text += "\nThe printer isn't answering right now (off or asleep?)."
         elif st.get("service") == "active":
             text = "Running, but not registered with a printer yet. Is the printer on and on this network?"
+        elif st.get("service") in ("activating", "reloading"):
+            text = "Starting…"
         else:
             text = "Not running. Turn on Start at login and press Save."
         self.status_label.set_text(text)
@@ -310,14 +362,7 @@ class Window(Gtk.ApplicationWindow):
         return False
 
     def open_last(self, folder):
-        path = self.last_files[0]
-        if folder:
-            run = [sys.executable, "-I", "-c",
-                   "import sys; from importlib.machinery import SourceFileLoader as L; "
-                   "L('m', sys.argv[1]).load_module().show_in_folder(sys.argv[2])", program(), path]
-            subprocess.Popen(run)
-        else:
-            subprocess.Popen(["xdg-open", path])
+        (show_in_folder if folder else open_file)(self.last_files[0])
 
     # ---------------------------------------------------------------- actions
 
@@ -352,18 +397,29 @@ class Window(Gtk.ApplicationWindow):
         except OSError as e:
             self.message.set_text(f"Couldn't save: {e}")
             return
-        self.cfg = load_config()
-        if self.autostart.get_active():
+        self.cfg = load_config()[0]
+        enable = self.autostart.get_active()
+        button.set_sensitive(False)
+        self.message.set_text("Saved. Restarting the service…" if enable else "Saved. Stopping the service…")
+
+        def work():
+            if not enable:
+                systemctl("disable")
+                return systemctl("stop")
             code, out = systemctl("enable")
-            if code == 0:
-                code, out = systemctl("restart")
-            self.message.set_text("Saved. The service restarted with the new settings." if code == 0
-                                  else f"Saved, but the service couldn't start: {out}")
-        else:
-            systemctl("disable")
-            systemctl("stop")
-            self.message.set_text("Saved. The service is stopped and won't start at login.")
-        GLib.timeout_add_seconds(3, lambda: self.refresh_status() and False)
+            return systemctl("restart") if code == 0 else (code, out)
+
+        def done(result):
+            button.set_sensitive(True)
+            code, out = result if isinstance(result, tuple) else (1, str(result))
+            if not enable:
+                self.message.set_text("Saved. The service is stopped and won't start at login.")
+            else:
+                self.message.set_text("Saved. The service restarted with the new settings." if code == 0
+                                      else f"Saved, but the service couldn't start: {out}")
+            GLib.timeout_add_seconds(2, lambda: self.refresh_status() and False)
+            return False
+        self.in_background(work, done)
 
     def on_test(self, button):
         button.set_sensitive(False)
@@ -374,7 +430,7 @@ class Window(Gtk.ApplicationWindow):
             with tempfile.TemporaryDirectory() as tmp:
                 path = os.path.join(tmp, "config.ini")
                 write_config(path, values, codes)
-                return run_program("-c", path, "--scan-now", timeout=900)
+                return run_program("-c", path, "--scan-now", "--json", timeout=900)
 
         def done(result):
             button.set_sensitive(True)
@@ -382,11 +438,17 @@ class Window(Gtk.ApplicationWindow):
                 self.message.set_text(f"Test scan failed: {result}")
             else:
                 code, out, err = result
-                if code == 0:
-                    self.message.set_text(out.strip().replace("saved", "Saved", 1))
-                    saved = out.split(": ", 1)[-1].split(", ")
-                    if saved and os.path.exists(saved[0].strip()):
-                        subprocess.Popen(["xdg-open", saved[0].strip()])
+                try:
+                    r = json.loads(out) if code == 0 else None
+                except ValueError:
+                    r = None
+                if r:
+                    files = r["files"]
+                    self.message.set_text(f"Saved {r['pages']} page(s)"
+                                          + (" (incomplete)" if r["partial"] else "")
+                                          + f": {', '.join(os.path.basename(f) for f in files)}")
+                    if files and os.path.exists(files[0]):
+                        open_file(files[0])
                 else:
                     lines = [l for l in err.strip().splitlines() if l.strip()]
                     self.message.set_text("Test scan failed: " + (lines[-1] if lines else f"exit {code}"))
