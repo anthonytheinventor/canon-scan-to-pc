@@ -9,15 +9,20 @@ On Linux the computer never shows up in the printer's list.
 
 `canon-scan-to-pc` fixes that. It's a small background service that makes your Linux computer
 appear in the printer's **Scan → Computer** list. When you pick it and press **Start**, the scan
-is saved to `~/Scans` as a PDF, with a desktop notification.
+is saved to `~/Scans` as a PDF, with a desktop notification that can open it.
+
+![The settings window](docs/settings-window.png)
 
 - Scan from the glass or the document feeder, and multi-page feeder scans become one PDF
 - Follows the color choice made at the printer (Color or Black & White)
 - Finds the printer on the network by itself
+- A settings window (in your applications menu as **Canon Scan to PC**) for the printer,
+  folder, file format, resolution and paper size, with status and a test scan
+- Notifications with **Open** and **Show in folder** buttons
 - Removes itself from the printer's list when the computer sleeps or shuts down, and
   comes back on wake-up
 - No root, no Canon software, no build step: one Python file plus a systemd user service
-- Light: one process, about 16 MB of memory, and practically no CPU while idle (one tiny
+- Light: one process, about 10 MB of memory, and practically no CPU while idle (one tiny
   network packet every 10 seconds). Scans are converted in a short-lived helper process, a
   page at a time, so even long feeder scans don't make the service grow
 
@@ -48,24 +53,41 @@ Requirements:
 
 ## Install
 
+**Debian, Ubuntu, Linux Mint:** download the `.deb` from the
+[latest release](../../releases/latest) and open it, or:
+
+```
+sudo apt install ./canon-scan-to-pc_*_all.deb
+```
+
+Then open **Canon Scan to PC** from your applications menu, check the printer, turn on
+**Start at login** and press **Save**. (From a terminal instead:
+`systemctl --user enable --now canon-scan-to-pc`.)
+
+**Any other distribution** (no root needed):
+
 ```
 git clone https://github.com/anthonytheinventor/canon-scan-to-pc.git
 cd canon-scan-to-pc
 ./install.sh
 ```
 
-The installer copies the program to `~/.local/bin`, puts the settings in
-`~/.config/canon-scan-to-pc/config.ini`, looks for your printer, and starts the service.
-It runs every time you log in.
+The installer copies the programs to `~/.local/bin`, adds the menu entry, puts the settings
+in `~/.config/canon-scan-to-pc/config.ini`, looks for your printer, and starts the service.
+To remove it: `./install.sh --uninstall`.
 
-Then, at the printer: **Scan → Computer →** *your computer's name* **→** choose Color or
-Black & White **→ Start**. The file appears in `~/Scans`.
+Either way, the service runs whenever you're logged in. Then, at the printer:
+**Scan → Computer →** *your computer's name* **→** choose Color or Black & White **→ Start**.
+The file appears in `~/Scans`.
 
-To remove it: `./install.sh --uninstall`
+**Headless server:** a user service only runs while that user is logged in. To keep it
+running without a login, run `sudo loginctl enable-linger <user>` once. Desktop
+notifications are skipped when there's no desktop.
 
 ## Settings
 
-Edit `~/.config/canon-scan-to-pc/config.ini`, then run `systemctl --user restart canon-scan-to-pc`.
+Use the settings window, or edit `~/.config/canon-scan-to-pc/config.ini` and run
+`systemctl --user restart canon-scan-to-pc`.
 
 | Setting | Default | Options |
 |---|---|---|
@@ -83,6 +105,7 @@ Edit `~/.config/canon-scan-to-pc/config.ini`, then run `systemctl --user restart
 Other commands:
 
 ```
+canon-scan-to-pc --status      # is it running, where is it registered, last scan
 canon-scan-to-pc --discover    # list Canon scanners on the network
 canon-scan-to-pc --scan-now    # scan once with your settings, without using the printer's panel
 journalctl --user -u canon-scan-to-pc -f    # watch what it's doing

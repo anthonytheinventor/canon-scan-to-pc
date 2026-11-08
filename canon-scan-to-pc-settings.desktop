@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Canon Scan to PC
+GenericName=Scan to Computer settings
+Comment=Use the Scan → Computer button on Canon imageCLASS / i-SENSYS printers
+Exec=canon-scan-to-pc-settings
+Icon=scanner
+Terminal=false
+Categories=Graphics;Scanning;
+Keywords=scan;scanner;canon;imageclass;i-sensys;printer;
+StartupNotify=true

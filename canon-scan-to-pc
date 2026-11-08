@@ -10,6 +10,7 @@ Protocol notes come from packet captures of the Windows utility; see README.md.
 """
 import configparser
 import getpass
+import json
 import logging
 import os
 import re
@@ -21,6 +22,8 @@ import subprocess
 import sys
 import threading
 import time
+
+__version__ = "1.1.0"
 
 PORT = 8610
 KEEPALIVE_S = 10
@@ -476,17 +479,63 @@ def write_pdf(path, pages, res):
         f.write(b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (size, xref))
 
 
-def notify(cfg, summary, body=""):
+def notify(cfg, summary, body="", path=None):
+    """Desktop notification. With a path, it gets "Open" and "Show in folder" buttons;
+    notify-send waits for the click, so that runs in a short-lived thread."""
     try:
         enabled = cfg["scan"].getboolean("notify", True)
     except ValueError:
         enabled = True
-    if enabled and shutil.which("notify-send"):
+    if not enabled or not shutil.which("notify-send"):
+        return
+    cmd = ["notify-send", "-a", "Canon Scan", "-i", "scanner", summary, body]
+    if path is None:
         try:
-            subprocess.run(["notify-send", "-a", "Canon Scan", "-i", "scanner", summary, body],
-                           timeout=10, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(cmd, timeout=10, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except (OSError, subprocess.SubprocessError) as e:
             log.debug("notification failed: %s", e)
+        return
+    threading.Thread(target=_notify_with_actions, daemon=True, name="notify",
+                     args=(cmd + ["--action=open=Open", "--action=folder=Show in folder"], path)).start()
+
+
+def _notify_with_actions(cmd, path):
+    try:
+        # Returns when the notification is clicked, dismissed or expires.
+        choice = subprocess.run(cmd, capture_output=True, text=True, timeout=24 * 3600).stdout.strip()
+        if choice == "open":
+            subprocess.Popen(["xdg-open", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        elif choice == "folder":
+            show_in_folder(path)
+    except (OSError, subprocess.SubprocessError) as e:
+        log.debug("notification failed: %s", e)
+
+
+def show_in_folder(path):
+    """Open the file manager with the file selected (FileManager1 over D-Bus, which Nemo,
+    Nautilus, Dolphin and Thunar implement); fall back to opening the folder."""
+    from urllib.parse import quote
+    uri = "file://" + quote(os.path.abspath(path))
+    try:
+        r = subprocess.run(["dbus-send", "--session", "--print-reply", "--dest=org.freedesktop.FileManager1",
+                            "--type=method_call", "/org/freedesktop/FileManager1",
+                            "org.freedesktop.FileManager1.ShowItems", f"array:string:{uri}", "string:"],
+                           capture_output=True, timeout=10)
+        if r.returncode == 0:
+            return
+    except (OSError, subprocess.SubprocessError):
+        pass
+    subprocess.Popen(["xdg-open", os.path.dirname(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def record_scan(**info):
+    """Remember the last scan for --status and the settings window."""
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(os.path.join(STATE_DIR, "last-scan.json"), "w") as f:
+            json.dump(dict(info, time=time.strftime("%Y-%m-%d %H:%M:%S")), f)
+    except OSError as e:
+        log.debug("couldn't record the scan: %s", e)
 
 
 # ---------------------------------------------------------------- sleep handling
@@ -726,6 +775,64 @@ def load_config(path):
     return cfg
 
 
+def effective_name(cfg, warn=False):
+    """The name shown on the printer: configured, or this computer's host name."""
+    name = cfg["printer"]["name"].strip() or default_name()
+    if len(name) > 15 or not name.isascii():
+        name = name.encode("ascii", "replace").decode()[:15]
+        if warn:
+            log.warning("the printer shows at most 15 ASCII characters; using name %r", name)
+    return name
+
+
+def status(cfg, config_path, as_json):
+    """What the service is doing, for people and for the settings window."""
+    name = effective_name(cfg)
+    st = {"version": __version__, "config": config_path, "name": name,
+          "host_setting": cfg["printer"]["host"].strip() or "auto"}
+    try:
+        st["service"] = subprocess.run(["systemctl", "--user", "is-active", "canon-scan-to-pc"],
+                                       capture_output=True, text=True, timeout=10).stdout.strip()
+        st["start_at_login"] = subprocess.run(["systemctl", "--user", "is-enabled", "canon-scan-to-pc"],
+                                              capture_output=True, text=True, timeout=10).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        st["service"] = st["start_at_login"] = "unknown"
+    try:
+        with open(state_file(name)) as f:
+            st["registered_with"], st["session"] = f.read().split()
+    except (OSError, ValueError):
+        st["registered_with"] = None
+    if st["registered_with"] and st["service"] == "active":
+        ident = mfnp_identity(st["registered_with"])
+        m = re.search(r"MDL:([^;]*)", ident or "")
+        st["printer_model"] = m.group(1) if m else None
+        st["printer_reachable"] = ident is not None
+    try:
+        with open(os.path.join(STATE_DIR, "last-scan.json")) as f:
+            st["last_scan"] = json.load(f)
+    except (OSError, ValueError):
+        st["last_scan"] = None
+    if as_json:
+        print(json.dumps(st, indent=2))
+        return 0
+    print(f"canon-scan-to-pc {__version__}")
+    print(f"service:          {st['service']} (start at login: {st['start_at_login']})")
+    if st["registered_with"] and st["service"] == "active":
+        where = f"{st.get('printer_model') or 'printer'} at {st['registered_with']}"
+        print(f"registered:       as {name} with {where}"
+              + ("" if st.get("printer_reachable") else " (not answering right now)"))
+    else:
+        print(f"registered:       no (name {name}, printer {st['host_setting']})")
+    ls = st["last_scan"]
+    if ls:
+        result = ls.get("error") or f"{ls.get('pages')} page(s){' (incomplete)' if ls.get('partial') else ''}"
+        print(f"last scan:        {ls['time']}: {result}")
+        for f in ls.get("files") or []:
+            print(f"                  {f}")
+    print(f"config:           {config_path}")
+    return 0
+
+
 def run(cfg):
     stop_event = threading.Event()
 
@@ -748,10 +855,7 @@ def run(cfg):
             delay = min(delay * 2, 300)
     if stopping():
         return
-    name = cfg["printer"]["name"].strip() or default_name()
-    if len(name) > 15 or not name.isascii():
-        name = name.encode("ascii", "replace").decode()[:15]
-        log.warning("the printer shows at most 15 ASCII characters; using name %r", name)
+    name = effective_name(cfg, warn=True)
     printer = Printer(host, name, getpass.getuser().capitalize())
 
     # Raw pages left behind by a scan that was killed.
@@ -849,10 +953,12 @@ def run(cfg):
             try:
                 saved, n, partial = scan(cfg, printer.addr or printer.host, mode, stopping)
                 log.info("saved %d page(s): %s", n, ", ".join(saved))
+                record_scan(files=saved, pages=n, partial=partial, mode=mode)
                 notify(cfg, f"Scan incomplete: only {n} page(s) saved" if partial else "Scan saved",
-                       "\n".join(os.path.basename(s) for s in saved))
+                       "\n".join(os.path.basename(s) for s in saved), path=saved[0])
             except Exception as e:      # keep the service alive whatever the scan does
                 log.error("scan failed: %s", e)
+                record_scan(error=str(e)[:300], mode=mode)
                 notify(cfg, "Scan failed", str(e)[:200])
             continue                     # poll again right away
         stop_event.wait(KEEPALIVE_S)
@@ -875,6 +981,9 @@ def main():
     ap.add_argument("-v", "--verbose", action="store_true")
     ap.add_argument("--scan-now", action="store_true", help="scan once with the configured settings and exit")
     ap.add_argument("--discover", action="store_true", help="list Canon scanners found on the network and exit")
+    ap.add_argument("--status", action="store_true", help="show what the service is doing and exit")
+    ap.add_argument("--json", action="store_true", help="with --status: machine-readable output")
+    ap.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     args = ap.parse_args()
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(levelname)s %(message)s" if os.environ.get("INVOCATION_ID")
@@ -884,6 +993,8 @@ def main():
     except configparser.Error as e:
         log.error("can't read %s: %s", args.config, e)
         return 2                         # the systemd unit doesn't restart on exit code 2
+    if args.status:
+        return status(cfg, args.config, args.json)
     if args.discover:
         printers = discover()
         for ip, model in printers:

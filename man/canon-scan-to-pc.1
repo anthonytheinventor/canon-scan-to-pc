@@ -1,0 +1,41 @@
+.TH CANON-SCAN-TO-PC 1 "2026" "canon-scan-to-pc" "User Commands"
+.SH NAME
+canon-scan-to-pc \- receive "Scan \(-> Computer" scans from a Canon imageCLASS / i-SENSYS printer
+.SH SYNOPSIS
+.B canon-scan-to-pc
+[\fB\-c\fR \fIconfig\fR] [\fB\-v\fR] [\fB\-\-status\fR [\fB\-\-json\fR] | \fB\-\-discover\fR | \fB\-\-scan\-now\fR | \fB\-\-version\fR]
+.SH DESCRIPTION
+Registers this computer in a Canon printer's \fBScan \(-> Computer\fR list (Canon's MFNP
+protocol, UDP port 8610) and keeps it there. When this computer is picked on the printer
+and Start is pressed, the scan is fetched with SANE's pixma backend and saved, by default
+as a PDF in \fI~/Scans\fR. It signs off before the computer sleeps or shuts down.
+.PP
+It normally runs as the systemd user service \fBcanon-scan-to-pc.service\fR; settings can be
+changed with \fBcanon-scan-to-pc-settings\fR(1).
+.SH OPTIONS
+.TP
+.BR \-c ", " \-\-config " " \fIfile\fR
+Settings file (default \fI~/.config/canon-scan-to-pc/config.ini\fR).
+.TP
+.B \-\-status
+Show whether the service runs, where it is registered, and the last scan.
+.B \-\-json
+gives machine-readable output.
+.TP
+.B \-\-discover
+List Canon scanners on the network (needs \fBavahi-browse\fR).
+.TP
+.B \-\-scan\-now
+Scan once with the configured settings, without using the printer's panel.
+.TP
+.BR \-v ", " \-\-verbose
+Debug logging.
+.SH FILES
+.I ~/.config/canon-scan-to-pc/config.ini
+(an annotated example is in \fI/usr/share/doc/canon-scan-to-pc/config.ini.example\fR)
+.SH SEE ALSO
+.BR canon-scan-to-pc-settings (1),
+.BR scanimage (1),
+.BR sane-pixma (5)
+.PP
+https://github.com/anthonytheinventor/canon-scan-to-pc
