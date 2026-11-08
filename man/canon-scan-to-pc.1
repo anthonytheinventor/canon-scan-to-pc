@@ -3,7 +3,7 @@
 canon-scan-to-pc \- receive "Scan \(-> Computer" scans from a Canon imageCLASS / i-SENSYS printer
 .SH SYNOPSIS
 .B canon-scan-to-pc
-[\fB\-c\fR \fIconfig\fR] [\fB\-v\fR] [\fB\-\-status\fR [\fB\-\-json\fR] | \fB\-\-discover\fR | \fB\-\-scan\-now\fR | \fB\-\-version\fR]
+[\fB\-c\fR \fIconfig\fR] [\fB\-v\fR] [\fB\-\-status\fR [\fB\-\-json\fR] | \fB\-\-discover\fR | \fB\-\-scan\-now\fR [\fB\-\-json\fR] | \fB\-\-version\fR]
 .SH DESCRIPTION
 Registers this computer in a Canon printer's \fBScan \(-> Computer\fR list (Canon's MFNP
 protocol, UDP port 8610) and keeps it there. When this computer is picked on the printer
@@ -27,6 +27,8 @@ List Canon scanners on the network (needs \fBavahi-browse\fR).
 .TP
 .B \-\-scan\-now
 Scan once with the configured settings, without using the printer's panel.
+.B \-\-json
+prints the saved files, page count and whether the scan was cut short.
 .TP
 .BR \-v ", " \-\-verbose
 Debug logging.

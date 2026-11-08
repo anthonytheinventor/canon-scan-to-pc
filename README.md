@@ -22,7 +22,8 @@ is saved to `~/Scans` as a PDF, with a desktop notification that can open it.
   older systems get a plain notification)
 - Removes itself from the printer's list when the computer sleeps or shuts down, and
   comes back on wake-up
-- No root, no Canon software, no build step: one Python file plus a systemd user service
+- No root, no Canon software, no build step: two Python programs (the service and its
+  settings window) plus a systemd user service
 - Light: one process, about 10 MB of memory, and practically no CPU while idle (one tiny
   network packet every 10 seconds; the newest notification's buttons stay usable for an hour,
   which adds about 6 MB). Scans are converted in a short-lived helper process, a

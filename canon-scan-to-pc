@@ -78,12 +78,15 @@ class Printer:
         self.addr = None                  # host resolved to an IP address
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.lock = threading.Lock()
+        self.resolve_failed = False
 
     def _resolve(self):
         try:
             self.addr = socket.gethostbyname(self.host)
         except (OSError, UnicodeError) as e:   # UnicodeError: malformed name like "a..b"
-            log.debug("cannot resolve %s: %s", self.host, e)
+            log.log(logging.DEBUG if self.resolve_failed else logging.WARNING,
+                    "can't look up %s (%s); retrying", self.host, e)
+            self.resolve_failed = True
             self.addr = None
         return self.addr
 
@@ -286,7 +289,7 @@ def feeder_loaded(host):
 def run_scanimage(cmd, env, should_stop):
     """Run scanimage; stop it if the service is stopping. Returns (exit code, stderr)."""
     p = subprocess.Popen(cmd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-    deadline = time.monotonic() + 900
+    deadline = time.monotonic() + 3600     # a hang guard; long 600-dpi feeder jobs take a while
     while True:
         try:
             _, err = p.communicate(timeout=1)
@@ -312,7 +315,7 @@ def unique_path(outdir, stem, ext):
 
 
 def scan(cfg, host, mode=None, should_stop=lambda: False):
-    """Scan with the configured settings. Returns (saved file paths, page count)."""
+    """Scan with the configured settings. Returns (saved file paths, page count, partial)."""
     import tempfile
     sc = cfg["scan"]
     mode = mode or sc.get("mode", "Color")
@@ -337,7 +340,8 @@ def scan(cfg, host, mode=None, should_stop=lambda: False):
 
     # Raw pages go under ~/.local/state, not /tmp: /tmp is RAM (tmpfs) on many distros.
     os.makedirs(STATE_DIR, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="scan-", dir=STATE_DIR) as tmp:
+    # The process id in the name: a starting service only removes folders of dead processes.
+    with tempfile.TemporaryDirectory(prefix=f"scan-{os.getpid()}-", dir=STATE_DIR) as tmp:
         for src in sources:
             sane_source = SANE_SOURCES.get(src, "Flatbed")
             cmd = ["scanimage", "-d", device, "--source", sane_source, "--mode", mode,
@@ -383,10 +387,21 @@ def scan(cfg, host, mode=None, should_stop=lambda: False):
 def convert(args):
     """Image conversion runs in a short-lived child process, so Pillow and the decoded
     pages never stay in the service's memory."""
-    p = subprocess.run([sys.executable, "-I", os.path.abspath(__file__), "--convert", *args],
-                       capture_output=True, text=True, timeout=600)
-    if p.returncode != 0:
-        raise RuntimeError(f"converting the scan failed: {p.stderr.strip()[-300:]}")
+    try:
+        p = subprocess.run([sys.executable, "-I", os.path.abspath(__file__), "--convert", *args],
+                           capture_output=True, text=True, timeout=1800)
+        error = p.stderr.strip()[-300:] if p.returncode != 0 else None
+    except subprocess.TimeoutExpired:
+        error = "it took too long"
+    if error is not None:
+        for dest in args[2:]:            # a killed child can't remove its own .part files
+            if dest == "--":
+                break
+            try:
+                os.remove(dest + ".part")
+            except OSError:
+                pass
+        raise RuntimeError(f"converting the scan failed: {error}")
 
 
 def convert_main(args):
@@ -541,17 +556,35 @@ def _notify_with_actions(cmd, path):
         show_in_folder(path)
 
 
+SESSION_VARS = ("DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY", "XDG_CURRENT_DESKTOP",
+                "XDG_SESSION_TYPE", "XDG_SESSION_DESKTOP", "DESKTOP_SESSION")
+
+
+def desktop_env():
+    """This process's environment plus the desktop session's display variables. The service
+    starts at login before the desktop hands DISPLAY and friends to systemd, so its own
+    environment lacks them; the user manager has them by now."""
+    env = dict(os.environ)
+    try:
+        out = subprocess.run(["systemctl", "--user", "show-environment"], capture_output=True,
+                             text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return env
+    for line in out.splitlines():
+        key, _, value = line.partition("=")
+        if key in SESSION_VARS and not value.startswith("$'"):   # $'..' = shell-quoted, skip
+            env[key] = value
+    return env
+
+
 def launch(cmd):
     """Start a desktop program (a document viewer, the file manager) in its own systemd
     scope. Started directly, it would belong to this service, and systemd would close it
     whenever the service stops or restarts (say, after Save in the settings window)."""
+    if shutil.which("systemd-run"):
+        cmd = ["systemd-run", "--user", "--scope", "--quiet", "--collect", "--", *cmd]
     try:
-        if shutil.which("systemd-run"):
-            r = subprocess.run(["systemd-run", "--user", "--scope", "--quiet", "--collect", "--", *cmd],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            if r.returncode == 0:
-                return
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(cmd, env=desktop_env(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except OSError as e:
         log.debug("couldn't start %s: %s", cmd[0], e)
 
@@ -713,6 +746,20 @@ class SystemBus:
         self.sock.close()
 
 
+def dbus_strings(body, count):
+    """The first `count` strings of a D-Bus message body made only of strings."""
+    out, i = [], 0
+    try:
+        for _ in range(count):
+            i = (i + 3) & ~3
+            n = struct.unpack_from("<I", body, i)[0]
+            out.append(body[i + 4:i + 4 + n].decode())
+            i += 4 + n + 1
+    except (struct.error, UnicodeDecodeError):
+        pass
+    return out
+
+
 class SleepWatcher(threading.Thread):
     """Signs off before the computer sleeps, so the printer's list never shows a computer
     that can't answer, and lets the main loop register again after wake-up.
@@ -754,6 +801,11 @@ class SleepWatcher(threading.Thread):
                           "AddMatch", "s", ("type='signal',sender='org.freedesktop.login1',"
                                             "interface='org.freedesktop.login1.Manager',"
                                             "member='PrepareForSleep',path='/org/freedesktop/login1'",))
+            # logind gets a new bus name if it restarts (say, in a systemd upgrade)
+            self.bus.call("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
+                          "AddMatch", "s", ("type='signal',sender='org.freedesktop.DBus',"
+                                            "interface='org.freedesktop.DBus',member='NameOwnerChanged',"
+                                            "arg0='org.freedesktop.login1'",))
             self.owner_serial = self.bus.call("org.freedesktop.DBus", "/org/freedesktop/DBus",
                                               "org.freedesktop.DBus", "GetNameOwner", "s",
                                               ("org.freedesktop.login1",))
@@ -780,6 +832,13 @@ class SleepWatcher(threading.Thread):
                     log.warning("D-Bus call %s failed; sleep handling may not work", reply_serial)
                 for fd in fds:
                     os.close(fd)
+                if (mtype == 4 and member == "NameOwnerChanged" and sender == "org.freedesktop.DBus"):
+                    names = dbus_strings(body, 3)
+                    if len(names) == 3 and names[0] == "org.freedesktop.login1" and names[2]:
+                        self.login1 = names[2]
+                        log.info("logind restarted; taking the sleep inhibitor again")
+                        self._release()
+                        self._inhibit()
                 # Any local program may send a signal; only logind's count.
                 if (mtype == 4 and member == "PrepareForSleep" and len(body) >= 4
                         and sender is not None and sender == self.login1):
@@ -905,10 +964,11 @@ def run(cfg):
     name = effective_name(cfg, warn=True)
     printer = Printer(host, name, getpass.getuser().capitalize())
 
-    # Raw pages left behind by a scan that was killed.
+    # Raw pages left behind by a scan that was killed (not those of a --scan-now running now).
     try:
         for d in os.listdir(STATE_DIR):
-            if d.startswith("scan-"):
+            pid = d.split("-")[1] if d.count("-") >= 2 else ""
+            if d.startswith("scan-") and not (pid.isdigit() and os.path.exists(f"/proc/{pid}")):
                 shutil.rmtree(os.path.join(STATE_DIR, d), ignore_errors=True)
     except OSError:
         pass
@@ -948,14 +1008,19 @@ def run(cfg):
                 if watcher.asleep.is_set():   # sleep began while registering
                     printer.sign_off()
                     continue
-                with open(state_file(name), "w") as f:
-                    f.write(f"{printer.host} {printer.dialog:#x}\n")
+                try:
+                    with open(state_file(name), "w") as f:
+                        f.write(f"{printer.host} {printer.dialog:#x}\n")
+                except OSError as e:     # only the leftover clean-up after a crash needs it
+                    log.warning("couldn't save the session: %s", e)
                 last_request = None
                 log.info("registered with %s as %s (session %#x)", printer.host, name, printer.dialog)
                 backoff = KEEPALIVE_S
                 misses = 0
             else:
-                log.debug("printer not answering; retrying in %ss", backoff)
+                # Said once per outage at INFO, so a wrong host or a printer that's off shows in the log.
+                log.log(logging.INFO if backoff == KEEPALIVE_S else logging.DEBUG,
+                        "%s isn't answering; retrying", printer.host)
                 stop_event.wait(backoff)
                 if auto and backoff >= 40:   # several misses: the printer may have a new address
                     printer.host = find_printer() or printer.host

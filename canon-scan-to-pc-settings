@@ -430,7 +430,7 @@ class Window(Gtk.ApplicationWindow):
             with tempfile.TemporaryDirectory() as tmp:
                 path = os.path.join(tmp, "config.ini")
                 write_config(path, values, codes)
-                return run_program("-c", path, "--scan-now", "--json", timeout=900)
+                return run_program("-c", path, "--scan-now", "--json", timeout=3600)
 
         def done(result):
             button.set_sensitive(True)

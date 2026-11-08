@@ -23,7 +23,7 @@ fi
 
 missing=""
 command -v scanimage >/dev/null || missing="$missing sane-utils"
-python3 -c 'import PIL' 2>/dev/null || missing="$missing python3-pil"
+python3 -I -c 'import PIL' 2>/dev/null || missing="$missing python3-pil"
 if [ -n "$missing" ]; then
     echo "Missing packages:$missing"
     echo "On Debian, Ubuntu or Mint:  sudo apt install$missing"
